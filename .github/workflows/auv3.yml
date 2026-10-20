@@ -40,6 +40,7 @@ jobs:
         run: >
           cmake -S auv3 -B build -G Xcode
           -DCLAP_WRAPPER_DOWNLOAD_DEPENDENCIES=ON
+          -DCMAKE_CXX_STANDARD=17
           -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
           -DPOLARITY_CLAP_LOCATION="$PWD/target/bundled/Polarity-SC-Dark.clap"
 
