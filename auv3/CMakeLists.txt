@@ -7,6 +7,9 @@ set(POLARITY_CLAP_LOCATION "" CACHE PATH "Absolute path to the built Polarity-SC
 add_subdirectory(clap-wrapper EXCLUDE_FROM_ALL)
 
 if (APPLE)
+    if ("${POLARITY_CLAP_LOCATION}" STREQUAL "")
+        message(FATAL_ERROR "clap-wrapper: POLARITY_CLAP_LOCATION must point to the built Polarity-SC-Dark.clap bundle")
+    endif()
     add_executable(polarity_sc_dark_as_auv3)
     target_add_auv3_wrapper(
             TARGET polarity_sc_dark_as_auv3
