@@ -65,9 +65,9 @@ jobs:
             [ -n "$f" ] && [ -e "$f" ] || { echo "missing build product: '$f'" >&2; ls -R build >&2; exit 1; }
           done
           lipo -info "$clap/Contents/MacOS/Polarity-SC-Dark"
-          ditto -R "$appex" stage/Polarity-SC-Dark.appex
-          ditto -R "$app" "stage/Polarity-SC-Dark AUv3.app"
-          ditto -R "$clap" "stage/Polarity-SC-Dark.clap"
+          ditto "$appex" stage/Polarity-SC-Dark.appex
+          ditto "$app" "stage/Polarity-SC-Dark AUv3.app"
+          ditto "$clap" "stage/Polarity-SC-Dark.clap"
       - uses: actions/upload-artifact@v4
         with:
           name: auv3-macos
