@@ -58,7 +58,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p stage
-          appex="$(find build -maxdepth 3 -name 'Polarity-SC-Dark.appex' -not -path '*/PlugIns/*' | head -1)"
+          # The real signed appex (with Info.plist + Mach-O) may live either as the
+          # auv3 target product or inside the standalone app's PlugIns; the
+          # un-plist'd directory clap-wrapper keeps at build top level is only
+          # its embedded-CLAP staging area, so require Contents/Info.plist.
+          appex="$(find build -maxdepth 5 -type d -name 'Polarity-SC-Dark.appex' \
+                     -exec test -e '{}/Contents/Info.plist' ';' -print | head -1)"
           app="$(find build -maxdepth 3 -type d -name 'Polarity-SC-Dark AUv3.app' | head -1)"
           clap="target/bundled/Polarity-SC-Dark.clap"
           for f in "$appex" "$app" "$clap"; do
