@@ -1,9 +1,9 @@
+# Deactivated as a push/tag workflow: releases only need the AUv3, and
+# `.github/workflows/auv3.yml` builds its own universal CLAP. This workflow
+# stays for manual multi-platform VST3/CLAP builds via the Actions tab.
 name: Build Plugin Binaries
 
 on:
-  push:
-    tags:
-      - "*"
   workflow_dispatch:
 
 permissions:
