@@ -154,12 +154,14 @@ jobs:
           merge-multiple: true
 
       - name: Zip each platform archive
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           cd dist
           for artifact_dir in */; do
             stem="${artifact_dir%/}"
-            zip -qr "${stem}.zip" "${stem}"
+            zip -qr "Polarity-SC-Dark-${TAG}-${stem}.zip" "${stem}"
           done
           ls -l *.zip
 

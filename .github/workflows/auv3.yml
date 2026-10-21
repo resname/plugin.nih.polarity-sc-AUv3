@@ -100,11 +100,14 @@ jobs:
           path: dist
 
       - name: Zip the auv3 artifact
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           cd dist
-          zip -qr auv3-macos.zip Polarity-SC-Dark.appex "Polarity-SC-Dark AUv3.app" Polarity-SC-Dark.clap
-          ls -l auv3-macos.zip
+          ASSET="Polarity-SC-Dark-${TAG}-macos-auv3.zip"
+          zip -qr "$ASSET" Polarity-SC-Dark.appex "Polarity-SC-Dark AUv3.app" Polarity-SC-Dark.clap
+          ls -l "$ASSET"
 
       - name: Create or reuse the tag release
         env:
@@ -122,5 +125,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" dist/auv3-macos.zip --clobber
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" "dist/Polarity-SC-Dark-${TAG}-macos-auv3.zip" --clobber
           gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --latest
