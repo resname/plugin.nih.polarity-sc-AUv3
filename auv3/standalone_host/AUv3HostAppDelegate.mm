@@ -479,7 +479,10 @@ static MIDIPortRef sMIDIInputPort = 0;
       // count at the hardware sample rate; AVAudioEngine inserts the channel
       // converter for us.
       AVAudioChannelCount auChannels =
-          [[_avAudioUnit.AUAudioUnit.inputBusses firstObject].format channelCount];
+          [_avAudioUnit.AUAudioUnit.inputBusses count] > 0
+              ? [[_avAudioUnit.AUAudioUnit.inputBusses objectAtIndexedSubscript:0].format
+                    channelCount]
+              : 0;
       if (auChannels != 0 && inputFormat.channelCount != auChannels)
       {
         std::cout << "[auv3-standalone] connecting HW input (" << inputFormat.channelCount
