@@ -68,3 +68,7 @@ Close and reopen the editor window after editing `plugin/src/editor/theme.css`.
 
 - All vendored NIH-plug crates live under `framework/` because I like it.
 - `bundler.toml` is intentionally scoped to this single plugin.
+
+## AUv3
+
+An [AUv3](auv3/CMakeLists.txt) build via clap-wrapper targets Apple hosts (Logic Pro, GarageBand, MainStage, Digital Performer; iOS later). VST3/CLAP remain the primary formats — Cubase hosts no AU. CI builds a signed-for-test `auv3-macos` artifact ([`.github/workflows/auv3.yml`](.github/workflows/auv3.yml)). See [`auv3/MAC-BRINGUP.md`](auv3/MAC-BRINGUP.md) for re-signing, installing, and `auval`, and [`auv3/LOGIC-GATE.md`](auv3/LOGIC-GATE.md) for the Logic sidechain gate checklist.
