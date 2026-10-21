@@ -2,16 +2,7 @@ name: auv3
 on:
   workflow_dispatch:
   push:
-    branches: [master, worktree-auv3-clap-wrapper]
     tags: ["*"]
-    paths:
-      - 'plugin/**'
-      - 'framework/**'
-      - 'auv3/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'bundler.toml'
-      - '.github/workflows/auv3.yml'
 
 env:
   CARGO_TERM_COLOR: always

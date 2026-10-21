@@ -2,13 +2,8 @@ name: Build Plugin Binaries
 
 on:
   push:
-    branches:
-      - "**"
     tags:
       - "*"
-  pull_request:
-    branches:
-      - master
   workflow_dispatch:
 
 permissions:
