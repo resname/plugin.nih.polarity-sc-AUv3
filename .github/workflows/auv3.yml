@@ -96,6 +96,11 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
+          # download-artifact loses Unix file permissions (all files 644);
+          # launchd refuses to spawn the app with a non-executable main
+          # binary (NSPOSIXErrorDomain 111). Restore the exec bit on every
+          # Mach-O under Contents/MacOS before zipping.
+          find . -path '*/Contents/MacOS/*' -type f -exec chmod +x {} +
           ASSET="Polarity-SC-Dark-${TAG}-macos-auv3.zip"
           zip -qr "$ASSET" Polarity-SC-Dark.appex "Polarity-SC-Dark AUv3.app" Polarity-SC-Dark.clap
           ls -l "$ASSET"

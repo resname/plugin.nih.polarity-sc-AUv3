@@ -154,6 +154,9 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
+          # download-artifact loses Unix file permissions; restore exec bits
+          # (standalone executables become unlaunchable otherwise).
+          find . -path '*/Contents/MacOS/*' -type f -exec chmod +x {} +
           for artifact_dir in */; do
             stem="${artifact_dir%/}"
             zip -qr "Polarity-SC-Dark-${TAG}-${stem}.zip" "${stem}"
