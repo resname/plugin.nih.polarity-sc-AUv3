@@ -18,6 +18,23 @@ if (APPLE)
         message(FATAL_ERROR "clap-wrapper: POLARITY_CLAP_LOCATION must point to the built Polarity-SC-Dark.clap bundle")
     endif()
     add_executable(polarity_sc_dark_as_auv3)
+    # Embed the CLAP into the appex's Contents/PlugIns/. pinned clap-wrapper does
+    # this too (macos_include_clap_in_bundle), but its destination is relative to
+    # the LIBRARY_OUTPUT_DIRECTORY property, which under the Xcode generator does
+    # not resolve inside the built .appex — the CI appex shipped without a
+    # PlugIns dir and the AU then failed to load ("Cannot load CLAP plugin").
+    # A PRE_BUILD copy with an absolute bundle dir also stays ahead of the
+    # wrapper's POST_BUILD ad-hoc codesign, so the CLAP is covered by the
+    # signature. `codesign --deep` is not needed at runtime; the nested un-signed
+    # .clap Mach-O is accepted as a plugin payload of a signed appex.
+    add_custom_command(TARGET polarity_sc_dark_as_auv3 PRE_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                "$<TARGET_BUNDLE_DIR:polarity_sc_dark_as_auv3>/Contents/PlugIns"
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${POLARITY_CLAP_LOCATION}"
+                "$<TARGET_BUNDLE_DIR:polarity_sc_dark_as_auv3>/Contents/PlugIns/Polarity-SC-Dark.clap"
+            COMMENT "Embedding Polarity-SC-Dark.clap into the AUv3 appex"
+    )
     target_add_auv3_wrapper(
             TARGET polarity_sc_dark_as_auv3
             OUTPUT_NAME "Polarity-SC-Dark"

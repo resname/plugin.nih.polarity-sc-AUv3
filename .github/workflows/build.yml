@@ -132,3 +132,54 @@ jobs:
         with:
           name: ${{ env.ARCHIVE_NAME }}
           path: ${{ env.ARCHIVE_NAME }}
+
+  publish-release:
+    # Tag-triggered GitHub Release with the unsigned build archives.
+    name: Attach archives to release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download all packaged archives
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: polarity-sc-dark-*
+          merge-multiple: true
+
+      - name: Zip each platform archive
+        run: |
+          set -euo pipefail
+          cd dist
+          for artifact_dir in */; do
+            stem="${artifact_dir%/}"
+            zip -qr "${stem}.zip" "${stem}"
+          done
+          ls -l *.zip
+
+      - name: Create or reuse the tag release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Both this workflow and auv3.yml may reach the release first; make
+          # the creation step idempotent rather than racing on last write.
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+              --title "Polarity-SC-Dark $TAG" \
+              --notes "Unsigned build. See README.md: trust the macOS builds with System Settings > Privacy & Security > Open Anyway, or xattr -dr com.apple.quarantine <path>."
+
+      - name: Upload archive assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" dist/*.zip --clobber
+          gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --latest
