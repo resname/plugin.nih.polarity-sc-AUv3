@@ -57,4 +57,17 @@ if (APPLE)
             AU_SUBTYPE "PscD"
             AU_MANUFACTURER "Plsc"
     )
+
+    # Swap the wrapper's AUv3HostAppDelegate.mm for our local patched copy
+    # (auv3/standalone_host/): the upstream version connects the hardware
+    # input with the raw hardware format, so a mono built-in microphone
+    # throws kAudioUnitErr_FormatNotSupported (-10868) against the appex's
+    # stereo input bus ("Failed to set up audio engine"). Same fix is being
+    # proposed upstream; remove this override when the submodule pin picks
+    # it up.
+    get_target_property(_ausa_sources polarity_sc_dark_as_auv3_standalone SOURCES)
+    list(REMOVE_ITEM _ausa_sources
+            "${CLAP_WRAPPER_CMAKE_CURRENT_SOURCE_DIR}/src/detail/standalone/macos/auv3/AUv3HostAppDelegate.mm")
+    list(APPEND _ausa_sources "${CMAKE_CURRENT_SOURCE_DIR}/standalone_host/AUv3HostAppDelegate.mm")
+    set_target_properties(polarity_sc_dark_as_auv3_standalone PROPERTIES SOURCES "${_ausa_sources}")
 endif()
