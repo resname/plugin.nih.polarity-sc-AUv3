@@ -50,7 +50,7 @@ jobs:
       # source directory name.
       - name: Build appex + standalone
         run: |
-          xcodebuild -project "$(ls -d build/*.xcodeproj | head -1)" -configuration Release -jobs 4 \
+          xcodebuild -project "$(ls -d build/*.xcodeproj | sed -n '1p')" -configuration Release -jobs 4 \
             -target polarity_sc_dark_as_auv3 \
             -target polarity_sc_dark_as_auv3_standalone
 
@@ -63,8 +63,8 @@ jobs:
           # un-plist'd directory clap-wrapper keeps at build top level is only
           # its embedded-CLAP staging area, so require Contents/Info.plist.
           appex="$(find build -maxdepth 5 -type d -name 'Polarity-SC-Dark.appex' \
-                     -exec test -e '{}/Contents/Info.plist' ';' -print | head -1)"
-          app="$(find build -maxdepth 3 -type d -name 'Polarity-SC-Dark AUv3.app' | head -1)"
+                     -exec test -e '{}/Contents/Info.plist' ';' -print | sed -n '1p')"
+          app="$(find build -maxdepth 3 -type d -name 'Polarity-SC-Dark AUv3.app' | sed -n '1p')"
           clap="target/bundled/Polarity-SC-Dark.clap"
           for f in "$appex" "$app" "$clap"; do
             [ -n "$f" ] && [ -e "$f" ] || { echo "missing build product: '$f'" >&2; ls -R build >&2; exit 1; }
