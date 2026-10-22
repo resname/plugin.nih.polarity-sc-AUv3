@@ -55,7 +55,10 @@ pub mod theme;
 /// The entire GUI's width, in logical pixels.
 const GUI_WIDTH: u32 = 1360;
 /// The entire GUI's height, in logical pixels.
-const GUI_HEIGHT: u32 = 530;
+// 530 + 40: one extra GenericUi row (~30px + spacing) was added for the
+// 'Upwards Max Boost' parameter. Keep this in sync with the
+// PREFERRED_GUI_SIZE "1360x570" in auv3/CMakeLists.txt.
+const GUI_HEIGHT: u32 = 570;
 
 // All GUI colors are defined in `editor::theme`.
 
