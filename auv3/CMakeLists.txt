@@ -44,6 +44,14 @@ if (APPLE)
             MANUFACTURER_NAME "polarity-music"
             MANUFACTURER_CODE "Plsc"
             SUBTYPE_CODE "PscD"
+            # Fixed plugin GUI size (ViziaState in the Rust plugin). The
+            # build helper writes it into the appex Info.plist and the view
+            # controller seeds preferredContentSize from it — the viewbridge
+            # runs loadView before any audio unit exists, so a build-time
+            # constant is the only source hosts capturing preferredContentSize
+            # once at view capture can use. Update when the plugin GUI size
+            # changes.
+            PREFERRED_GUI_SIZE "1360x530"
             MACOS_EMBEDDED_CLAP_LOCATION "${POLARITY_CLAP_LOCATION}"
     )
     add_executable(polarity_sc_dark_as_auv3_standalone)
