@@ -554,6 +554,8 @@ static MIDIPortRef sMIDIInputPort = 0;
       }
 
       self->_auViewController = vc;
+      std::cout << "[auv3-standalone] vc=" << (__bridge void *)vc << " class="
+                << NSStringFromClass([vc class]).UTF8String << std::endl;
 
       // Observe preferredContentSize — the AU view controller sets this
       // asynchronously when the CLAP GUI is created (after viewDidMoveToWindow).
@@ -573,7 +575,9 @@ static MIDIPortRef sMIDIInputPort = 0;
       [window setDelegate:self];
       // Not resizable: the plugin's GUI has fixed dimensions and user feedback
       // was that a plain non-resizable window (no border resize arrows) is
-      // preferred over a stretching container.
+      // preferred over a stretching container. The XIB seeds the resizable
+      // bit, so clear it.
+      window.styleMask &= ~NSWindowStyleMaskResizable;
       window.contentMinSize = NSMakeSize(100, 100);
 
       NSView *contentView = [window contentView];
@@ -633,6 +637,7 @@ static MIDIPortRef sMIDIInputPort = 0;
     [window setContentSize:preferredSize];
     [window setDelegate:self];
     // Not resizable — see setupGUI.
+    window.styleMask &= ~NSWindowStyleMaskResizable;
 
     NSView *contentView = [window contentView];
     NSView *auView = vc.view;
@@ -828,9 +833,17 @@ static void midiInputCallback(const MIDIPacketList *pktlist, void *readProcRefCo
 {
   AUAudioUnit *au = _directAU ? _directAU : _avAudioUnit.AUAudioUnit;
   Class auv3Class = NSClassFromString(@"ClapAUv3AudioUnit");
+  std::cout << "[auv3-standalone] probe: classFound="
+            << (auv3Class ? "YES" : "NO")
+            << " au=" << (__bridge void *)au
+            << " auClass=" << ([au isKindOfClass:[NSObject class]] ? NSStringFromClass([au class]).UTF8String : "n/a")
+            << " isWrapperAU=" << ((au && auv3Class && [au isKindOfClass:auv3Class]) ? "YES" : "NO")
+            << std::endl;
   if (au && auv3Class && [au isKindOfClass:auv3Class])
   {
     CGSize s = [(ClapAUv3AudioUnit *)au currentGUISize];
+    std::cout << "[auv3-standalone] probe: currentGUISize=" << (int)s.width << "x" << (int)s.height
+              << std::endl;
     if (s.width > 1 && s.height > 1) return s;
   }
   return CGSizeZero;
