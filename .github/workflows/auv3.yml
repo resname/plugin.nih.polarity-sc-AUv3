@@ -72,10 +72,11 @@ jobs:
           path: stage
 
   publish-release:
-    # Tag-triggered: attach the AUv3 standalone app + appex as two separate
-    # .dmg containers (no combined .zip, no CLAP) to the GitHub Release the
-    # build.yml publish-release job creates (creation is idempotent there).
-    # hdiutil only exists on macOS, so this runs on a macos runner.
+    # Tag-triggered: attach the AUv3 standalone app (as a drag-to-Applications
+    # installer .dmg) and the appex (as a .zip) as two separate assets to the
+    # GitHub Release the build.yml publish-release job creates (creation is
+    # idempotent there). hdiutil only exists on macOS, so this runs on a
+    # macos runner.
     name: Attach AUv3 to release
     if: startsWith(github.ref, 'refs/tags/')
     needs: auv3-macos
@@ -93,7 +94,7 @@ jobs:
           name: auv3-macos
           path: dist
 
-      - name: Build the release .dmgs
+      - name: Build the release assets
         env:
           TAG: ${{ github.ref_name }}
         run: |
@@ -102,13 +103,18 @@ jobs:
           # download-artifact loses Unix file permissions (all files 644);
           # launchd refuses to spawn the app with a non-executable main
           # binary (NSPOSIXErrorDomain 111). Restore the exec bit on every
-          # Mach-O under Contents/MacOS before imaging.
+          # Mach-O under Contents/MacOS before packaging.
           find . -path '*/Contents/MacOS/*' -type f -exec chmod +x {} +
+          APPEX_ZIP="Resname-Spectral-Compressor-${TAG}-appex.zip"
           APP_DMG="Resname-Spectral-Compressor-${TAG}-standalone.dmg"
-          APPEX_DMG="Resname-Spectral-Compressor-${TAG}-appex.dmg"
-          hdiutil create -ov -volname "Resname Spectral Compressor" -srcfolder "Resname Spectral Compressor AUv3.app" -format UDZO "$APP_DMG"
-          hdiutil create -ov -volname "Resname Spectral Compressor" -srcfolder "Resname-Spectral-Compressor.appex" -format UDZO "$APPEX_DMG"
-          ls -l "$APP_DMG" "$APPEX_DMG"
+          zip -qr "$APPEX_ZIP" "Resname-Spectral-Compressor.appex"
+          # Classic drag-to-install layout: the app plus a symlink to the
+          # Applications folder so the user can drag it into place.
+          mkdir -p dmgroot
+          cp -R "Resname Spectral Compressor AUv3.app" dmgroot/
+          ln -s /Applications dmgroot/Applications
+          hdiutil create -ov -volname "Resname Spectral Compressor" -srcfolder dmgroot -format UDZO "$APP_DMG"
+          ls -l "$APPEX_ZIP" "$APP_DMG"
 
       - name: Create or reuse the tag release
         env:
@@ -128,6 +134,6 @@ jobs:
         run: |
           gh release upload "$TAG" -R "$GITHUB_REPOSITORY" \
             "dist/Resname-Spectral-Compressor-${TAG}-standalone.dmg" \
-            "dist/Resname-Spectral-Compressor-${TAG}-appex.dmg" \
+            "dist/Resname-Spectral-Compressor-${TAG}-appex.zip" \
             --clobber
           gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --latest
