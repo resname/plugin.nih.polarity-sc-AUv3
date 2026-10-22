@@ -301,6 +301,12 @@ pub struct CompressorParams {
     /// The compression knee width, in decibels.
     #[id = "knee"]
     pub knee_width_db: FloatParam,
+    /// The maximum gain the compressor may add relative to the envelope. Without this limit the
+    /// upwards compressor keeps amplifying its slowly releasing envelope during silence, so the
+    /// gain keeps rising until the signal returns and spikes. Only used for (and thus only
+    /// visible in) the upwards bank; setting it to 0 disables upwards gain completely.
+    #[id = "max_gain_change_db"]
+    pub max_gain_change_db: FloatParam,
 }
 
 impl ThresholdParams {
@@ -559,6 +565,24 @@ impl CompressorParams {
             .with_callback(set_update_knee_parabolas)
             .with_unit(" dB")
             .with_step_size(0.1),
+            max_gain_change_db: {
+                let param = FloatParam::new(
+                    format!("{name_prefix} Max Boost"),
+                    // The upwards compressor is the only user of this cap; the downwards
+                    // compressor only ever attenuates. 24 dB is high enough not to interfere with
+                    // normal upwards compression while keeping the silence ramp bounded.
+                    24.0,
+                    FloatRange::Linear { min: 0.0, max: 96.0 },
+                )
+                .with_unit(" dB")
+                .with_step_size(0.1);
+                // A dead 'Downwards Max Boost' slider would be confusing in the generic UI
+                if name_prefix == DOWNWARDS_NAME_PREFIX {
+                    param.hide()
+                } else {
+                    param
+                }
+            },
         }
     }
 }
@@ -1210,6 +1234,8 @@ impl CompressorBank {
     ) {
         let downwards_knee_width_db = params.compressors.downwards.knee_width_db.value();
         let upwards_knee_width_db = params.compressors.upwards.knee_width_db.value();
+        let upwards_max_gain_change_db =
+            params.compressors.upwards.max_gain_change_db.value();
 
         assert!(self.downwards_thresholds_db.len() == buffer.len());
         assert!(self.downwards_ratios.len() == buffer.len());
@@ -1261,6 +1287,13 @@ impl CompressorBank {
                     *upwards_knee_parabola_scale,
                     *upwards_knee_parabola_intercept,
                 )
+                // Without this cap the upwards compressor keeps amplifying its slowly
+                // releasing envelope in silence: the release ramps to the -100 dB floor which
+                // sits ever further below the threshold, so the gain difference keeps rising
+                // 'on its own' and spikes when the signal comes back. The gain difference
+                // relative to the envelope is capped since the envelope itself should remain
+                // untouched.
+                .min(envelope_db + upwards_max_gain_change_db)
             } else {
                 envelope_db
             };
@@ -1302,6 +1335,8 @@ impl CompressorBank {
     ) {
         let downwards_knee_width_db = params.compressors.downwards.knee_width_db.value();
         let upwards_knee_width_db = params.compressors.upwards.knee_width_db.value();
+        let upwards_max_gain_change_db =
+            params.compressors.upwards.max_gain_change_db.value();
 
         // For the channel linking
         let num_channels = self.sidechain_spectrum_magnitudes.len() as f32;
@@ -1388,6 +1423,8 @@ impl CompressorBank {
                     upwards_knee_parabola_scale,
                     upwards_knee_parabola_intercept,
                 )
+                // The same silence-ramp cap as in `compress()`
+                .min(envelope_db + upwards_max_gain_change_db)
             } else {
                 envelope_db
             };
