@@ -5,4 +5,4 @@
 # name = "Human Readable Plugin Name"  # defaults to <package_name>
 
 [polarity_sc_dark]
-name = "Polarity-SC-Dark"
+name = "Resname-Spectral-Compressor"

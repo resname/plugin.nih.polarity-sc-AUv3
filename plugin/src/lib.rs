@@ -49,7 +49,7 @@ const MIN_OVERLAP_ORDER: usize = 2;
 const DEFAULT_OVERLAP_ORDER: usize = 4;
 const MAX_OVERLAP_ORDER: usize = 5;
 
-const VST3_CLASS_ID_BYTES: [u8; 16] = *b"Polarity-SC-Dark";
+const VST3_CLASS_ID_BYTES: [u8; 16] = *b"resname-spectral";
 
 /// This is a port of <https://github.com/robbert-vdh/spectral-compressor/>.
 pub struct SpectralCompressor {
@@ -310,8 +310,8 @@ impl SpectralCompressorParams {
 }
 
 impl Plugin for SpectralCompressor {
-    const NAME: &'static str = "Polarity-SC-Dark";
-    const VENDOR: &'static str = "Polarity-Music";
+    const NAME: &'static str = "Resname Spectral Compressor";
+    const VENDOR: &'static str = "resname";
     const URL: &'static str = env!("CARGO_PKG_HOMEPAGE");
     const EMAIL: &'static str = "hey@polarity.productions";
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
@@ -757,7 +757,7 @@ fn process_stft_sidechain(
 }
 
 impl ClapPlugin for SpectralCompressor {
-    const CLAP_ID: &'static str = "de.polarity-music.polarity-sc-dark";
+    const CLAP_ID: &'static str = "de.resname.resname-spectral-compressor";
     const CLAP_DESCRIPTION: Option<&'static str> =
         Some("Turn things into pink noise on demand and more.");
     const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);

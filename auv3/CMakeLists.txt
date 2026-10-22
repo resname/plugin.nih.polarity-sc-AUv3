@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.21)
 project(polarity_sc_auv3 LANGUAGES CXX OBJC OBJCXX)
 
 set(CLAP_WRAPPER_DOWNLOAD_DEPENDENCIES TRUE CACHE BOOL "Download clap-headers for the wrapper")
-set(POLARITY_CLAP_LOCATION "" CACHE PATH "Absolute path to the built Polarity-SC-Dark.clap bundle")
+set(POLARITY_CLAP_LOCATION "" CACHE PATH "Absolute path to the built Resname-Spectral-Compressor.clap bundle")
 
 add_subdirectory(clap-wrapper EXCLUDE_FROM_ALL)
 
@@ -15,7 +15,7 @@ if ("${POLARITY_PLUGIN_VERSION}" STREQUAL "")
 endif()
 if (APPLE)
     if ("${POLARITY_CLAP_LOCATION}" STREQUAL "")
-        message(FATAL_ERROR "clap-wrapper: POLARITY_CLAP_LOCATION must point to the built Polarity-SC-Dark.clap bundle")
+        message(FATAL_ERROR "clap-wrapper: POLARITY_CLAP_LOCATION must point to the built Resname-Spectral-Compressor.clap bundle")
     endif()
     add_executable(polarity_sc_dark_as_auv3)
     # Embed the CLAP into the appex's Contents/PlugIns/. pinned clap-wrapper does
@@ -32,18 +32,18 @@ if (APPLE)
                 "$<TARGET_BUNDLE_DIR:polarity_sc_dark_as_auv3>/Contents/PlugIns"
             COMMAND ${CMAKE_COMMAND} -E copy_directory
                 "${POLARITY_CLAP_LOCATION}"
-                "$<TARGET_BUNDLE_DIR:polarity_sc_dark_as_auv3>/Contents/PlugIns/Polarity-SC-Dark.clap"
-            COMMENT "Embedding Polarity-SC-Dark.clap into the AUv3 appex"
+                "$<TARGET_BUNDLE_DIR:polarity_sc_dark_as_auv3>/Contents/PlugIns/Resname-Spectral-Compressor.clap"
+            COMMENT "Embedding Resname-Spectral-Compressor.clap into the AUv3 appex"
     )
     target_add_auv3_wrapper(
             TARGET polarity_sc_dark_as_auv3
-            OUTPUT_NAME "Polarity-SC-Dark"
-            BUNDLE_IDENTIFIER "de.polarity-music.polarity-sc-dark.auv3"
+            OUTPUT_NAME "Resname-Spectral-Compressor"
+            BUNDLE_IDENTIFIER "de.resname.resname-spectral-compressor.auv3"
             BUNDLE_VERSION "${POLARITY_PLUGIN_VERSION}"
             INSTRUMENT_TYPE "aufx"
-            MANUFACTURER_NAME "polarity-music"
-            MANUFACTURER_CODE "Plsc"
-            SUBTYPE_CODE "PscD"
+            MANUFACTURER_NAME "resname"
+            MANUFACTURER_CODE "Rsnm"
+            SUBTYPE_CODE "Rscm"
             # Fixed plugin GUI size (ViziaState in the Rust plugin). The
             # build helper writes it into the appex Info.plist and the view
             # controller seeds preferredContentSize from it — the viewbridge
@@ -57,13 +57,13 @@ if (APPLE)
     add_executable(polarity_sc_dark_as_auv3_standalone)
     target_add_auv3_standalone_wrapper(
             TARGET polarity_sc_dark_as_auv3_standalone
-            OUTPUT_NAME "Polarity-SC-Dark AUv3"
-            BUNDLE_IDENTIFIER "de.polarity-music.polarity-sc-dark.auv3standalone"
+            OUTPUT_NAME "Resname Spectral Compressor AUv3"
+            BUNDLE_IDENTIFIER "de.resname.resname-spectral-compressor.auv3standalone"
             BUNDLE_VERSION "${POLARITY_PLUGIN_VERSION}"
             AUV3_TARGET polarity_sc_dark_as_auv3
             AU_TYPE "aufx"
-            AU_SUBTYPE "PscD"
-            AU_MANUFACTURER "Plsc"
+            AU_SUBTYPE "Rscm"
+            AU_MANUFACTURER "Rsnm"
     )
 
     # Swap the wrapper's AUv3HostAppDelegate.mm for our local patched copy

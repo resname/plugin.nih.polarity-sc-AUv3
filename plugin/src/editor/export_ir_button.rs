@@ -81,7 +81,7 @@ fn start_export(frozen_ir_data: Arc<AtomicRefCell<triple_buffer::Output<FrozenIr
 fn export_current_snapshot(snapshot: FrozenIrData) -> Result<Option<PathBuf>, String> {
     let Some(path) = rfd::FileDialog::new()
         .add_filter("Wave", &["wav"])
-        .set_file_name("polarity-sc-dark-freeze-ir.wav")
+        .set_file_name("resname-spectral-compressor-freeze-ir.wav")
         .save_file()
     else {
         return Ok(None);

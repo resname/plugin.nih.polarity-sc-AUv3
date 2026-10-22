@@ -24,7 +24,7 @@ jobs:
       # nih_plug_xtask writes all bundles to `<target-dir>/bundled/` (bundle_home()),
       # regardless of --target, so per-target `cargo xtask bundle --target ...` runs would
       # clobber each other. `bundle-universal` builds both Apple triples and lipo-merges
-      # them into a single universal `target/bundled/Polarity-SC-Dark.clap`.
+      # them into a single universal `target/bundled/Resname-Spectral-Compressor.clap`.
       - name: Build universal CLAP
         run: cargo xtask bundle-universal polarity_sc_dark --release
 
@@ -34,7 +34,7 @@ jobs:
           -DCLAP_WRAPPER_DOWNLOAD_DEPENDENCIES=ON
           -DCMAKE_CXX_STANDARD=17
           -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
-          -DPOLARITY_CLAP_LOCATION="$PWD/target/bundled/Polarity-SC-Dark.clap"
+          -DPOLARITY_CLAP_LOCATION="$PWD/target/bundled/Resname-Spectral-Compressor.clap"
 
       # Only the two wrapper targets are built. Never `-alltargets`: the top-level
       # clap-wrapper "clapasvst3" VST3 wrapper target (top_level_default.cmake) must not
@@ -54,17 +54,17 @@ jobs:
           # auv3 target product or inside the standalone app's PlugIns; the
           # un-plist'd directory clap-wrapper keeps at build top level is only
           # its embedded-CLAP staging area, so require Contents/Info.plist.
-          appex="$(find build -maxdepth 5 -type d -name 'Polarity-SC-Dark.appex' \
+          appex="$(find build -maxdepth 5 -type d -name 'Resname-Spectral-Compressor.appex' \
                      -exec test -e '{}/Contents/Info.plist' ';' -print | sed -n '1p')"
-          app="$(find build -maxdepth 3 -type d -name 'Polarity-SC-Dark AUv3.app' | sed -n '1p')"
-          clap="target/bundled/Polarity-SC-Dark.clap"
+          app="$(find build -maxdepth 3 -type d -name 'Resname Spectral Compressor AUv3.app' | sed -n '1p')"
+          clap="target/bundled/Resname-Spectral-Compressor.clap"
           for f in "$appex" "$app" "$clap"; do
             [ -n "$f" ] && [ -e "$f" ] || { echo "missing build product: '$f'" >&2; ls -R build >&2; exit 1; }
           done
-          lipo -info "$clap/Contents/MacOS/Polarity-SC-Dark"
-          ditto "$appex" stage/Polarity-SC-Dark.appex
-          ditto "$app" "stage/Polarity-SC-Dark AUv3.app"
-          ditto "$clap" "stage/Polarity-SC-Dark.clap"
+          lipo -info "$clap/Contents/MacOS/Resname-Spectral-Compressor"
+          ditto "$appex" stage/Resname-Spectral-Compressor.appex
+          ditto "$app" "stage/Resname Spectral Compressor AUv3.app"
+          ditto "$clap" "stage/Resname-Spectral-Compressor.clap"
       - uses: actions/upload-artifact@v4
         with:
           name: auv3-macos
@@ -101,8 +101,8 @@ jobs:
           # binary (NSPOSIXErrorDomain 111). Restore the exec bit on every
           # Mach-O under Contents/MacOS before zipping.
           find . -path '*/Contents/MacOS/*' -type f -exec chmod +x {} +
-          ASSET="Polarity-SC-Dark-${TAG}-macos-auv3.zip"
-          zip -qr "$ASSET" Polarity-SC-Dark.appex "Polarity-SC-Dark AUv3.app" Polarity-SC-Dark.clap
+          ASSET="Resname-Spectral-Compressor-${TAG}-macos-auv3.zip"
+          zip -qr "$ASSET" Resname-Spectral-Compressor.appex "Resname Spectral Compressor AUv3.app" Resname-Spectral-Compressor.clap
           ls -l "$ASSET"
 
       - name: Create or reuse the tag release
@@ -113,7 +113,7 @@ jobs:
           set -euo pipefail
           gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
             gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
-              --title "Polarity-SC-Dark $TAG" \
+              --title "Resname Spectral Compressor $TAG" \
               --notes "Unsigned build. See README.md: trust the macOS builds with System Settings > Privacy & Security > Open Anyway, or xattr -dr com.apple.quarantine <path>."
 
       - name: Upload the auv3 asset
@@ -121,5 +121,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" "dist/Polarity-SC-Dark-${TAG}-macos-auv3.zip" --clobber
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" "dist/Resname-Spectral-Compressor-${TAG}-macos-auv3.zip" --clobber
           gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --latest

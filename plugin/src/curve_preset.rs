@@ -226,7 +226,7 @@ impl TryFrom<UserCurvePresetFile> for CurvePreset {
 }
 
 pub(crate) fn user_preset_dir() -> Option<PathBuf> {
-    ProjectDirs::from("de", "Polarity-Music", "Polarity-SC-Dark")
+    ProjectDirs::from("de", "resname", "Resname-Spectral-Compressor")
         .map(|dirs| dirs.config_dir().join(USER_PRESET_FOLDER))
 }
 
@@ -681,6 +681,6 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("polarity-sc-dark-{label}-{nanos}"))
+        std::env::temp_dir().join(format!("resname-spectral-compressor-{label}-{nanos}"))
     }
 }

@@ -663,7 +663,7 @@ fn header_bar(cx: &mut Context) {
         Label::new(cx, ExportUiModel::status_text).class("match-status");
 
         HStack::new(cx, |cx| {
-            Label::new(cx, "Polarity-SC")
+            Label::new(cx, "Resname Spectral Compressor")
                 .class("plugin-title")
                 .on_mouse_down(|_, _| {
                     // `CARGO_PKG_HOMEPAGE` is `""` when no `homepage` is set in
