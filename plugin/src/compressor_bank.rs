@@ -35,6 +35,12 @@ const UPWARDS_NAME_PREFIX: &str = "Upwards";
 const GAIN_SMOOTHING_MAX_RADIUS_LN: f32 = std::f32::consts::LN_2;
 const PINK_NOISE_SLOPE_OFFSET_DB_PER_OCT: f32 = 3.0;
 
+/// Per-bin envelope follower values at or below this gain are considered silent. When every bin
+/// of a block is silent the compressor bypasses that block entirely: without this the upwards
+/// compressor keeps its (capped) boost alive in silence, so the gain keeps rising during long
+/// pauses and the first incoming sound after a long attack is very loud.
+const SILENCE_THRESHOLD_GAIN: f32 = 1e-4; // -80 dB
+
 /// The envelopes are initialized to the RMS value of a -24 dB sine wave to make sure extreme upwards
 /// compression doesn't cause pops when switching between window sizes and when deactivating and
 /// reactivating the plugin.
@@ -1259,6 +1265,15 @@ impl CompressorBank {
         // NOTE: In the sidechain compression mode these envelopes are computed from the sidechain
         //       signal instead of the main input
         for (bin_idx, envelope) in self.envelopes[channel_idx].iter().enumerate() {
+            // Bypass the bin entirely when it is silent (see SILENCE_THRESHOLD_GAIN): with no
+            // signal there is nothing to compress. The gain smoother then decays back to
+            // baseline during the pause, so the next incoming signal starts from unity gain
+            // instead of inheriting the accumulated (capped) upwards boost.
+            if *envelope <= SILENCE_THRESHOLD_GAIN {
+                self.raw_gain_difference_db[bin_idx] = 0.0;
+                continue;
+            }
+
             // We'll apply the transfer curve to the envelope signal, and then scale the complex
             // `bin` by the gain difference
             let envelope_db = util::gain_to_db_fast_epsilon(*envelope);
@@ -1380,6 +1395,14 @@ impl CompressorBank {
         }
 
         for (bin_idx, envelope) in self.envelopes[channel_idx].iter().enumerate() {
+            // NOTE: These envelopes are computed from the sidechain signal, so the block is
+            //       bypassed entirely when the sidechain input goes silent — the same
+            //       silence-ramp problem as in `compress()` (see SILENCE_THRESHOLD_GAIN)
+            if *envelope <= SILENCE_THRESHOLD_GAIN {
+                self.raw_gain_difference_db[bin_idx] = 0.0;
+                continue;
+            }
+
             let envelope_db = util::gain_to_db_fast_epsilon(*envelope);
 
             // The idea here is that we scale the compressor thresholds/knee values by the sidechain
@@ -1961,6 +1984,37 @@ mod tests {
         for gain_db in &compressor_bank.smoothed_gain_difference_db[..num_bins] {
             assert!((*gain_db + 6.0).abs() < 1.0e-5);
         }
+    }
+
+    /// A completely silent block must bypass compression entirely: without the
+    /// `SILENCE_THRESHOLD_GAIN` bypass the upwards compressor keeps boosting its releasing
+    /// envelope in silence (capped by 'Max Boost'), so the gain keeps rising during the pause
+    /// and the first incoming sound after a long attack is very loud.
+    #[test]
+    fn silence_bypasses_upwards_gain() {
+        let num_bins = 65;
+        let (mut compressor_bank, params, _frozen_ir_output_data) = make_bank_and_params(1, 128);
+        // Strong upwards compression: threshold -24 dBFS, 4:1 ratio, 6 dB knee
+        let (knee_scale, knee_intercept) = upwards_soft_knee_coefficients(-24.0, 6.0, 4.0);
+        compressor_bank.upwards_thresholds_db.fill(-24.0);
+        compressor_bank.upwards_ratios.fill(4.0);
+        compressor_bank.upwards_knee_parabola_scale.fill(knee_scale);
+        compressor_bank
+            .upwards_knee_parabola_intercept
+            .fill(knee_intercept);
+        configure_test_downwards_compression(&mut compressor_bank, 0.0, 1.0, 0.0);
+
+        // A silent spectrum: all bins at -100 dBFS
+        let mut buffer = make_complex_buffer(1.0e-5, num_bins);
+        compressor_bank.update_envelopes(&buffer, 0, &params, 4);
+        compressor_bank.compress(&mut buffer, 0, &params, 1, false, false);
+
+        assert!(compressor_bank.raw_gain_difference_db[..num_bins]
+            .iter()
+            .all(|raw| *raw == 0.0));
+        assert!(compressor_bank.smoothed_gain_difference_db[..num_bins]
+            .iter()
+            .all(|gain| gain.abs() < 1.0e-5));
     }
 
     #[test]

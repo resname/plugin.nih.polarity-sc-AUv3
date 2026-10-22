@@ -3167,7 +3167,7 @@ dependencies = [
 
 [[package]]
 name = "polarity_sc_dark"
-version = "0.5.21"
+version = "0.5.22"
 dependencies = [
  "atomic_float",
  "atomic_refcell",
