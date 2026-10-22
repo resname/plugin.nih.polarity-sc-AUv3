@@ -57,26 +57,29 @@ jobs:
           appex="$(find build -maxdepth 5 -type d -name 'Resname-Spectral-Compressor.appex' \
                      -exec test -e '{}/Contents/Info.plist' ';' -print | sed -n '1p')"
           app="$(find build -maxdepth 3 -type d -name 'Resname Spectral Compressor AUv3.app' | sed -n '1p')"
-          clap="target/bundled/Resname-Spectral-Compressor.clap"
-          for f in "$appex" "$app" "$clap"; do
+          for f in "$appex" "$app"; do
             [ -n "$f" ] && [ -e "$f" ] || { echo "missing build product: '$f'" >&2; ls -R build >&2; exit 1; }
           done
-          lipo -info "$clap/Contents/MacOS/Resname-Spectral-Compressor"
+          # The CLAP is only an intermediate build input for the wrapper targets; it is
+          # not shipped in releases (releases are the .app and the .appex). Lipo-verify
+          # its Mach-O anyway as a build sanity check.
+          lipo -info target/bundled/Resname-Spectral-Compressor.clap/Contents/MacOS/Resname-Spectral-Compressor
           ditto "$appex" stage/Resname-Spectral-Compressor.appex
           ditto "$app" "stage/Resname Spectral Compressor AUv3.app"
-          ditto "$clap" "stage/Resname-Spectral-Compressor.clap"
       - uses: actions/upload-artifact@v4
         with:
           name: auv3-macos
           path: stage
 
   publish-release:
-    # Tag-triggered: attach the AUv3 app + appex + CLAP to the GitHub Release
-    # the build.yml publish-release job creates (creation is idempotent there).
+    # Tag-triggered: attach the AUv3 standalone app + appex as two separate
+    # .dmg containers (no combined .zip, no CLAP) to the GitHub Release the
+    # build.yml publish-release job creates (creation is idempotent there).
+    # hdiutil only exists on macOS, so this runs on a macos runner.
     name: Attach AUv3 to release
     if: startsWith(github.ref, 'refs/tags/')
     needs: auv3-macos
-    runs-on: ubuntu-latest
+    runs-on: macos-15
     permissions:
       contents: write
 
@@ -90,7 +93,7 @@ jobs:
           name: auv3-macos
           path: dist
 
-      - name: Zip the auv3 artifact
+      - name: Build the release .dmgs
         env:
           TAG: ${{ github.ref_name }}
         run: |
@@ -99,11 +102,13 @@ jobs:
           # download-artifact loses Unix file permissions (all files 644);
           # launchd refuses to spawn the app with a non-executable main
           # binary (NSPOSIXErrorDomain 111). Restore the exec bit on every
-          # Mach-O under Contents/MacOS before zipping.
+          # Mach-O under Contents/MacOS before imaging.
           find . -path '*/Contents/MacOS/*' -type f -exec chmod +x {} +
-          ASSET="Resname-Spectral-Compressor-${TAG}-macos-auv3.zip"
-          zip -qr "$ASSET" Resname-Spectral-Compressor.appex "Resname Spectral Compressor AUv3.app" Resname-Spectral-Compressor.clap
-          ls -l "$ASSET"
+          APP_DMG="Resname-Spectral-Compressor-${TAG}-standalone.dmg"
+          APPEX_DMG="Resname-Spectral-Compressor-${TAG}-appex.dmg"
+          hdiutil create -ov -volname "Resname Spectral Compressor" -srcfolder "Resname Spectral Compressor AUv3.app" -format UDZO "$APP_DMG"
+          hdiutil create -ov -volname "Resname Spectral Compressor" -srcfolder "Resname-Spectral-Compressor.appex" -format UDZO "$APPEX_DMG"
+          ls -l "$APP_DMG" "$APPEX_DMG"
 
       - name: Create or reuse the tag release
         env:
@@ -116,10 +121,13 @@ jobs:
               --title "Resname Spectral Compressor $TAG" \
               --notes "Unsigned build. See README.md: trust the macOS builds with System Settings > Privacy & Security > Open Anyway, or xattr -dr com.apple.quarantine <path>."
 
-      - name: Upload the auv3 asset
+      - name: Upload the auv3 assets
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" "dist/Resname-Spectral-Compressor-${TAG}-macos-auv3.zip" --clobber
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" \
+            "dist/Resname-Spectral-Compressor-${TAG}-standalone.dmg" \
+            "dist/Resname-Spectral-Compressor-${TAG}-appex.dmg" \
+            --clobber
           gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --latest
