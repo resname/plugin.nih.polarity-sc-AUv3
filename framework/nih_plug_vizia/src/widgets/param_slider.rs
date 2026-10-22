@@ -26,6 +26,10 @@ pub struct ParamSlider {
     /// dragging for higher precision dragging. This is a `None` value when granular dragging is not
     /// active.
     granular_drag_status: Option<GranularDragStatus>,
+    /// The cursor position and normalized value when the current drag was started. Clicking on a
+    /// slider grabs the value at the click position and dragging moves relative to that grab
+    /// point instead of jumping the value to the cursor position.
+    drag_grab_status: Option<GranularDragStatus>,
 
     // These fields are set through modifiers:
     /// Whether or not to listen to scroll events for changing the parameter's value in steps.
@@ -107,6 +111,7 @@ impl ParamSlider {
             text_input_active: false,
             drag_active: false,
             granular_drag_status: None,
+            drag_grab_status: None,
 
             use_scroll_wheel: true,
             scrolled_lines: 0.0,
@@ -466,6 +471,7 @@ impl View for ParamSlider {
                     cx.release();
                     cx.set_active(false);
                     self.granular_drag_status = None;
+                    self.drag_grab_status = None;
                     self.param_base.end_set_parameter(cx);
                     meta.consume();
                 } else if cx.modifiers().alt() {
@@ -489,27 +495,38 @@ impl View for ParamSlider {
                     cx.focus();
                     cx.set_active(true);
 
-                    // When holding down shift while clicking on a parameter we want to granuarly
-                    // edit the parameter without jumping to a new value
+                    // Clicking on the slider grabs the value at the click position instead of
+                    // jumping straight to it: the value only changes once the mouse actually
+                    // moves. Shift+Click additionally enables the low-precision granular drag
+                    // multiplier below.
                     self.param_base.begin_set_parameter(cx);
-                    if cx.modifiers().shift() {
-                        self.granular_drag_status = Some(GranularDragStatus {
-                            starting_x_coordinate: cx.mouse().cursorx,
-                            starting_value: self.param_base.unmodulated_normalized_value(),
-                        });
-                    } else {
-                        self.granular_drag_status = None;
-                        self.set_normalized_value_drag(
-                            cx,
-                            util::remap_current_entity_x_coordinate(cx, cx.mouse().cursorx),
-                        );
-                    }
+                    self.drag_grab_status = Some(GranularDragStatus {
+                        starting_x_coordinate: cx.mouse().cursorx,
+                        starting_value: self.param_base.unmodulated_normalized_value(),
+                    });
                 }
 
                 meta.consume();
             }
-            WindowEvent::MouseDoubleClick(MouseButton::Left)
-            | WindowEvent::MouseDown(MouseButton::Right)
+            WindowEvent::MouseDoubleClick(MouseButton::Left) => {
+                // The first click of the double click may have started a grab drag: clean that
+                // up first, then always reset the parameter to its default value. This used to
+                // be inconsistent depending on whether the drag was still active.
+                if self.drag_active {
+                    self.drag_active = false;
+                    cx.release();
+                    cx.set_active(false);
+                    self.granular_drag_status = None;
+                    self.drag_grab_status = None;
+                }
+                self.param_base.begin_set_parameter(cx);
+                self.param_base
+                    .set_normalized_value(cx, self.param_base.default_normalized_value());
+                self.param_base.end_set_parameter(cx);
+
+                meta.consume();
+            }
+            WindowEvent::MouseDown(MouseButton::Right)
             | WindowEvent::MouseDoubleClick(MouseButton::Right)
             | WindowEvent::MouseTripleClick(MouseButton::Right) => {
                 // Same stale-drag recovery as above.
@@ -518,6 +535,7 @@ impl View for ParamSlider {
                     cx.release();
                     cx.set_active(false);
                     self.granular_drag_status = None;
+                    self.drag_grab_status = None;
                     self.param_base.end_set_parameter(cx);
                     meta.consume();
                 } else {
@@ -536,6 +554,7 @@ impl View for ParamSlider {
                     self.drag_active = false;
                     cx.release();
                     cx.set_active(false);
+                    self.drag_grab_status = None;
 
                     self.param_base.end_set_parameter(cx);
 
@@ -568,24 +587,41 @@ impl View for ParamSlider {
                             util::remap_current_entity_x_coordinate(cx, start_x + delta_x),
                         );
                     } else {
-                        self.granular_drag_status = None;
+                        // Relative grabbed drag: move the value by the distance the mouse has
+                        // moved since the grab point instead of jumping to the cursor position.
+                        // The fallback `get_or_insert` should never trigger mid-drag since the
+                        // grab point is stored at mouse down; if a drag was started some other
+                        // way this lazily anchors at the first move event instead.
+                        let grab_status = *self
+                            .drag_grab_status
+                            .get_or_insert_with(|| GranularDragStatus {
+                                starting_x_coordinate: *x,
+                                starting_value: self
+                                    .param_base
+                                    .unmodulated_normalized_value(),
+                            });
+                        let start_x =
+                            util::remap_current_entity_x_t(cx, grab_status.starting_value);
+                        // A 1:1 mapping: dragging the mouse by one pixel moves the bar by one
+                        // pixel. Holding Shift switches to the finer granular drag multiplier.
+                        let delta_x = *x - grab_status.starting_x_coordinate;
 
                         self.set_normalized_value_drag(
                             cx,
-                            util::remap_current_entity_x_coordinate(cx, *x),
+                            util::remap_current_entity_x_coordinate(cx, start_x + delta_x),
                         );
                     }
                 }
             }
             WindowEvent::KeyUp(_, Some(Key::Shift)) => {
-                // If this happens while dragging, snap back to reality uh I mean the current screen
-                // position
+                // If this happens while dragging, re-anchor the grab at the current value
+                // instead of jumping to the screen position
                 if self.drag_active && self.granular_drag_status.is_some() {
                     self.granular_drag_status = None;
-                    self.param_base.set_normalized_value(
-                        cx,
-                        util::remap_current_entity_x_coordinate(cx, cx.mouse().cursorx),
-                    );
+                    self.drag_grab_status = Some(GranularDragStatus {
+                        starting_x_coordinate: cx.mouse().cursorx,
+                        starting_value: self.param_base.unmodulated_normalized_value(),
+                    });
                 }
             }
             WindowEvent::MouseScroll(_scroll_x, scroll_y) if self.use_scroll_wheel => {

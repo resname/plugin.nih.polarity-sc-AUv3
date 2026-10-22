@@ -526,7 +526,13 @@ impl CompressorParams {
             .with_step_size(0.1),
             ratio: FloatParam::new(
                 format!("{name_prefix} Ratio"),
-                1.0,
+                // Downwards compression defaults to 2:1, upwards compression stays at 1:1
+                // (disengaged)
+                if name_prefix == DOWNWARDS_NAME_PREFIX {
+                    2.0
+                } else {
+                    1.0
+                },
                 FloatRange::Skewed {
                     min: 1.0,
                     max: 500.0,
@@ -572,7 +578,10 @@ impl CompressorParams {
                     // compressor only ever attenuates. 24 dB is high enough not to interfere with
                     // normal upwards compression while keeping the silence ramp bounded.
                     24.0,
-                    FloatRange::Linear { min: 0.0, max: 96.0 },
+                    FloatRange::Linear {
+                        min: 0.0,
+                        max: 96.0,
+                    },
                 )
                 .with_unit(" dB")
                 .with_step_size(0.1);
@@ -1234,8 +1243,7 @@ impl CompressorBank {
     ) {
         let downwards_knee_width_db = params.compressors.downwards.knee_width_db.value();
         let upwards_knee_width_db = params.compressors.upwards.knee_width_db.value();
-        let upwards_max_gain_change_db =
-            params.compressors.upwards.max_gain_change_db.value();
+        let upwards_max_gain_change_db = params.compressors.upwards.max_gain_change_db.value();
 
         assert!(self.downwards_thresholds_db.len() == buffer.len());
         assert!(self.downwards_ratios.len() == buffer.len());
@@ -1335,8 +1343,7 @@ impl CompressorBank {
     ) {
         let downwards_knee_width_db = params.compressors.downwards.knee_width_db.value();
         let upwards_knee_width_db = params.compressors.upwards.knee_width_db.value();
-        let upwards_max_gain_change_db =
-            params.compressors.upwards.max_gain_change_db.value();
+        let upwards_max_gain_change_db = params.compressors.upwards.max_gain_change_db.value();
 
         // For the channel linking
         let num_channels = self.sidechain_spectrum_magnitudes.len() as f32;
