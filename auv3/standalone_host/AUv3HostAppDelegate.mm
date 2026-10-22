@@ -23,6 +23,16 @@ static uint32_t fourCCFromString(const char *s)
   return ((uint32_t)s[0] << 24) | ((uint32_t)s[1] << 16) | ((uint32_t)s[2] << 8) | (uint32_t)s[3];
 }
 
+// Local interface shim for ClapAUv3AudioUnit (compiled into this process —
+// the AUv3 loads in-process here). It exposes currentGUISize: the plugin's
+// real CLAP GUI size. The view controller object the framework hands back
+// can be a freshly instantiated view-service instance whose
+// preferredContentSize only carries the wrapper's 400x500 loadView seed,
+// so we prefer the size reported by the audio unit itself.
+@interface ClapAUv3AudioUnit : AUAudioUnit
+- (CGSize)currentGUISize;
+@end
+
 // --- MIDI input state ---
 static MIDIClientRef sMIDIClient = 0;
 static MIDIPortRef sMIDIInputPort = 0;
@@ -552,7 +562,7 @@ static MIDIPortRef sMIDIInputPort = 0;
               options:NSKeyValueObservingOptionNew
               context:NULL];
 
-      NSSize preferredSize = vc.preferredContentSize;
+      NSSize preferredSize = [self targetGUISizeForController:vc];
       if (preferredSize.width < 1 || preferredSize.height < 1)
       {
         preferredSize = NSMakeSize(480, 360);
@@ -561,7 +571,9 @@ static MIDIPortRef sMIDIInputPort = 0;
       NSWindow *window = [self window];
       [window setContentSize:preferredSize];
       [window setDelegate:self];
-      window.styleMask |= NSWindowStyleMaskResizable;
+      // Not resizable: the plugin's GUI has fixed dimensions and user feedback
+      // was that a plain non-resizable window (no border resize arrows) is
+      // preferred over a stretching container.
       window.contentMinSize = NSMakeSize(100, 100);
 
       NSView *contentView = [window contentView];
@@ -611,7 +623,7 @@ static MIDIPortRef sMIDIInputPort = 0;
             options:NSKeyValueObservingOptionNew
             context:NULL];
 
-    NSSize preferredSize = vc.preferredContentSize;
+    NSSize preferredSize = [self targetGUISizeForController:vc];
     if (preferredSize.width < 1 || preferredSize.height < 1)
     {
       preferredSize = NSMakeSize(480, 360);
@@ -620,8 +632,7 @@ static MIDIPortRef sMIDIInputPort = 0;
     NSWindow *window = [self window];
     [window setContentSize:preferredSize];
     [window setDelegate:self];
-    // Ensure the window is resizable
-    window.styleMask |= NSWindowStyleMaskResizable;
+    // Not resizable — see setupGUI.
 
     NSView *contentView = [window contentView];
     NSView *auView = vc.view;
@@ -810,9 +821,36 @@ static void midiInputCallback(const MIDIPacketList *pktlist, void *readProcRefCo
 #pragma mark - GUI size tracking
 // ---------------------------------------------------------------------------
 
+// The plugin's real GUI size, asked from the audio unit directly (works only
+// in-process; returns zero when the unit is not the wrapper's class, e.g. a
+// remote AUv3 proxy).
+- (CGSize)realGUISize
+{
+  AUAudioUnit *au = _directAU ? _directAU : _avAudioUnit.AUAudioUnit;
+  Class auv3Class = NSClassFromString(@"ClapAUv3AudioUnit");
+  if (au && auv3Class && [au isKindOfClass:auv3Class])
+  {
+    CGSize s = [(ClapAUv3AudioUnit *)au currentGUISize];
+    if (s.width > 1 && s.height > 1) return s;
+  }
+  return CGSizeZero;
+}
+
+// The size to window around: the plugin's own size when the audio unit can
+// report it, otherwise the view controller's preferredContentSize (which may
+// only be the 400x500 loadView seed), otherwise zero.
+- (NSSize)targetGUISizeForController:(NSViewController *)vc
+{
+  CGSize realSize = [self realGUISize];
+  if (realSize.width > 1 && realSize.height > 1)
+    return NSMakeSize(realSize.width, realSize.height);
+  NSSize vcSize = vc.preferredContentSize;
+  return NSMakeSize((vcSize.width > 1) ? vcSize.width : 0, (vcSize.height > 1) ? vcSize.height : 0);
+}
+
 - (void)_resizeWindowToFitGUI:(NSViewController *)vc
 {
-  NSSize size = vc.preferredContentSize;
+  NSSize size = [self targetGUISizeForController:vc];
   NSWindow *window = [self window];
   if (size.width <= 0 || size.height <= 0 || !window) return;
 
@@ -832,48 +870,33 @@ static void midiInputCallback(const MIDIPacketList *pktlist, void *readProcRefCo
 
 - (void)_pollPreferredContentSize:(NSViewController *)vc retries:(int)retries
 {
-  if (retries <= 0)
+  NSSize size = [self targetGUISizeForController:vc];
+  NSWindow *window = [self window];
+  NSSize windowContent = window ? window.contentView.frame.size : NSZeroSize;
+
+  if (size.width <= 0 || size.height <= 0)
   {
-    // Last resort: re-request the VC from the AU to get a fresh proxy
-    // with updated preferredContentSize.
-    if (_avAudioUnit)
+    // No reliable size anywhere — keep waiting a bit.
+    if (retries <= 0)
     {
-      [_avAudioUnit.AUAudioUnit
-          requestViewControllerWithCompletionHandler:^(AUViewControllerBase *freshVC) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-              if (freshVC)
-              {
-                NSSize size = freshVC.preferredContentSize;
-                std::cout << "[auv3-standalone] Re-requested VC preferredContentSize: "
-                          << (int)size.width << "x" << (int)size.height << std::endl;
-                if (size.width > 0 && size.height > 0)
-                {
-                  self->_auViewController.preferredContentSize = size;
-                  [self _resizeWindowToFitGUI:self->_auViewController];
-                }
-              }
-            });
-          }];
+      std::cout << "[auv3-standalone] GUI size polling gave up (no reliable size)" << std::endl;
+      return;
     }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(500 * NSEC_PER_MSEC)),
+                   dispatch_get_main_queue(), ^{
+                     [self _pollPreferredContentSize:vc retries:retries - 1];
+                   });
     return;
   }
 
-  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(500 * NSEC_PER_MSEC)),
-                 dispatch_get_main_queue(), ^{
-                   NSSize size = vc.preferredContentSize;
-                   NSSize windowContent = [[self window] contentView].frame.size;
-
-                   if (size.width > 0 && size.height > 0 &&
-                       ((int)size.width != (int)windowContent.width ||
-                        (int)size.height != (int)windowContent.height))
-                   {
-                     [self _resizeWindowToFitGUI:vc];
-                   }
-                   else
-                   {
-                     [self _pollPreferredContentSize:vc retries:retries - 1];
-                   }
-                 });
+  if ((int)size.width != (int)windowContent.width || (int)size.height != (int)windowContent.height)
+  {
+    std::cout << "[auv3-standalone] polled GUI size " << (int)size.width << "x" << (int)size.height
+              << " differs from window content " << (int)windowContent.width << "x"
+              << (int)windowContent.height << " — resizing" << std::endl;
+    [self _resizeWindowToFitGUI:vc];
+  }
+  // Size already applied — stop polling.
 }
 
 // ---------------------------------------------------------------------------
