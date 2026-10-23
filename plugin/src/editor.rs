@@ -1024,35 +1024,37 @@ fn path_column(cx: &mut Context, path: CompressionPath) {
 /// Creates the analyzer panel on the right side of the editor.
 fn analyzer_column(cx: &mut Context) {
     VStack::new(cx, |cx| {
-        // Caption so the pair below reads as the curve-to-edit selection rather than
-        // unlabeled buttons.
-        Label::new(cx, "Curve:").class("curve-edit-caption");
-        // The analyzer shows and edits the curve points of the selected path
+        // The curve picker sits directly above the analyzer: the analyzer shows and
+        // edits the curve points of the selected path.
         HStack::new(cx, |cx| {
-            SelectStateButton::new(
-                cx,
-                Data::selected_threshold_curve,
-                0,
-                "Down",
-                "threshold-curve-button-down",
-            );
-            SelectStateButton::new(
-                cx,
-                Data::selected_threshold_curve,
-                1,
-                "Up",
-                "threshold-curve-button-up",
-            );
+            Label::new(cx, "Edit compression curve:").class("curve-edit-caption");
+            HStack::new(cx, |cx| {
+                SelectStateButton::new(
+                    cx,
+                    Data::selected_threshold_curve,
+                    0,
+                    "Downwards",
+                    "threshold-curve-button-down",
+                );
+                SelectStateButton::new(
+                    cx,
+                    Data::selected_threshold_curve,
+                    1,
+                    "Upwards",
+                    "threshold-curve-button-up",
+                );
+            })
+            .class("curve-matching-button-group");
         })
-        .class("curve-matching-button-group");
+        .class("curve-edit-row");
+        Analyzer::new(
+            cx,
+            Data::analyzer_data,
+            Data::sample_rate,
+            Data::params,
+            Data::selected_threshold_curve,
+        );
     });
-    Analyzer::new(
-        cx,
-        Data::analyzer_data,
-        Data::sample_rate,
-        Data::params,
-        Data::selected_threshold_curve,
-    );
 }
 
 /// A button that stores a value into one of the editor's `AtomicU8` selection states, e.g. which

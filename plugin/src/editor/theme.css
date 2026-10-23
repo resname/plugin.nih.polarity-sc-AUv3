@@ -225,9 +225,20 @@
   color: #1f1f1f;
 }
 
+.curve-edit-row {
+  size: auto;
+  col-between: 8px;
+  left: 2px;
+  top: 10px;
+}
+
 .curve-edit-caption {
   color: #8e8e95;
   child-left: 3px;
+  height: auto;
+  width: auto;
+  top: 1s;
+  bottom: 1s;
 }
 
 .curve-preset-control-group {
