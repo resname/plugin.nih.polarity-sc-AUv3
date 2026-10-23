@@ -1,6 +1,6 @@
 [package]
 name = "polarity_sc_dark"
-version = "0.6.2"
+version = "0.6.3"
 edition = "2021"
 authors = ["Robbert van der Helm <mail@robbertvanderhelm.nl>", "Robert Polarity Agthe <hey@polarity.productions>"]
 license = "GPL-3.0-or-later"
