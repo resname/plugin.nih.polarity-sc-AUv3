@@ -74,6 +74,12 @@ pub(crate) struct PathState {
     pub(crate) knee_parabola_scale: Vec<f32>,
     /// `b` in the equation from `knee_parabola_scale`.
     pub(crate) knee_parabola_intercept: Vec<f32>,
+    /// The current envelope value for each bin, in linear space. Indexed by
+    /// `[channel_idx][compressor_idx]`.
+    pub(crate) envelopes: Vec<Vec<f32>>,
+    /// Scratch buffer for this path's per-bin gain differences before they are combined with the
+    /// other path's.
+    pub(crate) raw_gain_difference_db: Vec<f32>,
 }
 
 impl PathState {
@@ -83,6 +89,8 @@ impl PathState {
             ratios: Vec::new(),
             knee_parabola_scale: Vec::new(),
             knee_parabola_intercept: Vec::new(),
+            envelopes: Vec::new(),
+            raw_gain_difference_db: Vec::new(),
         }
     }
 
@@ -95,6 +103,8 @@ impl PathState {
             .reserve_exact(complex_buffer_len.saturating_sub(self.knee_parabola_scale.len()));
         self.knee_parabola_intercept
             .reserve_exact(complex_buffer_len.saturating_sub(self.knee_parabola_intercept.len()));
+        self.raw_gain_difference_db
+            .reserve_exact(complex_buffer_len.saturating_sub(self.raw_gain_difference_db.len()));
     }
 
     fn resize_complex_len(&mut self, complex_buffer_len: usize) {
@@ -102,6 +112,20 @@ impl PathState {
         self.ratios.resize(complex_buffer_len, 1.0);
         self.knee_parabola_scale.resize(complex_buffer_len, 1.0);
         self.knee_parabola_intercept.resize(complex_buffer_len, 1.0);
+        self.raw_gain_difference_db.resize(complex_buffer_len, 0.0);
+    }
+
+    fn reserve_envelopes(&mut self, num_channels: usize, complex_buffer_len: usize) {
+        self.envelopes.resize_with(num_channels, Vec::new);
+        for envelopes in self.envelopes.iter_mut() {
+            envelopes.reserve_exact(complex_buffer_len.saturating_sub(envelopes.len()));
+        }
+    }
+
+    fn resize_envelopes(&mut self, complex_buffer_len: usize) {
+        for envelopes in self.envelopes.iter_mut() {
+            envelopes.resize(complex_buffer_len, ENVELOPE_INIT_VALUE);
+        }
     }
 }
 
@@ -147,9 +171,6 @@ pub struct CompressorBank {
     pub(crate) downwards: PathState,
     pub(crate) upwards: PathState,
 
-    /// The current envelope value for this bin, in linear space. Indexed by
-    /// `[channel_idx][compressor_idx]`.
-    envelopes: Vec<Vec<f32>>,
     /// A scaling factor for the envelope follower timings. This is set to 0 and then slowly brought
     /// back up to 1 after after [`CompressorBank::reset()`] has been called to allow the envelope
     /// followers to settle back in.
@@ -160,8 +181,8 @@ pub struct CompressorBank {
     sidechain_spectrum_magnitudes: Vec<Vec<f32>>,
     /// Per-bin channel-linked sidechain magnitudes for the current block.
     linked_sidechain_magnitudes: Vec<f32>,
-    /// Scratch buffer for per-bin gain differences before spectral smoothing.
-    raw_gain_difference_db: Vec<f32>,
+    /// The sum of both paths' per-bin gain differences before spectral smoothing.
+    combined_raw_gain_difference_db: Vec<f32>,
     /// Scratch buffer for the per-bin gain differences that will be applied.
     smoothed_gain_difference_db: Vec<f32>,
     /// Prefix sums for smoothing the gain curve without per-bin inner summing.
@@ -248,7 +269,7 @@ pub struct ThresholdCurvePointParams {
 }
 
 /// The type of threshold to use.
-#[derive(Enum, Debug, PartialEq, Eq)]
+#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThresholdMode {
     /// Configure the thresholds to offset pink noise. This means that the slope will receive an
     /// additional -3 dB/octave slope.
@@ -769,14 +790,13 @@ impl CompressorBank {
             downwards: PathState::new(),
             upwards: PathState::new(),
 
-            envelopes: vec![Vec::with_capacity(complex_buffer_len); num_channels],
             envelope_followers_timing_scale: 0.0,
             sidechain_spectrum_magnitudes: vec![
                 Vec::with_capacity(complex_buffer_len);
                 num_channels
             ],
             linked_sidechain_magnitudes: Vec::with_capacity(complex_buffer_len),
-            raw_gain_difference_db: Vec::with_capacity(complex_buffer_len),
+            combined_raw_gain_difference_db: Vec::with_capacity(complex_buffer_len),
             smoothed_gain_difference_db: Vec::with_capacity(complex_buffer_len),
             gain_smoothing_prefix_db: Vec::with_capacity(complex_buffer_len + 1),
             frozen_gain_difference_db: vec![Vec::with_capacity(complex_buffer_len); num_channels],
@@ -807,11 +827,10 @@ impl CompressorBank {
 
         self.downwards.reserve_complex_len(complex_buffer_len);
         self.upwards.reserve_complex_len(complex_buffer_len);
-
-        self.envelopes.resize_with(num_channels, Vec::new);
-        for envelopes in self.envelopes.iter_mut() {
-            envelopes.reserve_exact(complex_buffer_len.saturating_sub(envelopes.len()));
-        }
+        self.downwards
+            .reserve_envelopes(num_channels, complex_buffer_len);
+        self.upwards
+            .reserve_envelopes(num_channels, complex_buffer_len);
 
         self.sidechain_spectrum_magnitudes
             .resize_with(num_channels, Vec::new);
@@ -821,8 +840,9 @@ impl CompressorBank {
         self.linked_sidechain_magnitudes.reserve_exact(
             complex_buffer_len.saturating_sub(self.linked_sidechain_magnitudes.len()),
         );
-        self.raw_gain_difference_db
-            .reserve_exact(complex_buffer_len.saturating_sub(self.raw_gain_difference_db.len()));
+        self.combined_raw_gain_difference_db.reserve_exact(
+            complex_buffer_len.saturating_sub(self.combined_raw_gain_difference_db.len()),
+        );
         self.smoothed_gain_difference_db.reserve_exact(
             complex_buffer_len.saturating_sub(self.smoothed_gain_difference_db.len()),
         );
@@ -857,17 +877,16 @@ impl CompressorBank {
 
         self.downwards.resize_complex_len(complex_buffer_len);
         self.upwards.resize_complex_len(complex_buffer_len);
-
-        for envelopes in self.envelopes.iter_mut() {
-            envelopes.resize(complex_buffer_len, ENVELOPE_INIT_VALUE);
-        }
+        self.downwards.resize_envelopes(complex_buffer_len);
+        self.upwards.resize_envelopes(complex_buffer_len);
 
         for magnitudes in self.sidechain_spectrum_magnitudes.iter_mut() {
             magnitudes.resize(complex_buffer_len, 0.0);
         }
         self.linked_sidechain_magnitudes
             .resize(complex_buffer_len, 0.0);
-        self.raw_gain_difference_db.resize(complex_buffer_len, 0.0);
+        self.combined_raw_gain_difference_db
+            .resize(complex_buffer_len, 0.0);
         self.smoothed_gain_difference_db
             .resize(complex_buffer_len, 0.0);
         self.gain_smoothing_prefix_db
@@ -1002,46 +1021,83 @@ impl CompressorBank {
         }
 
         match mode {
-            ThresholdMode::Internal => {
-                self.update_envelopes(buffer, channel_idx, params, overlap_times);
-                self.measure_match_curve_complex(buffer, channel_idx, params, overlap_times);
-                self.compress(
-                    buffer,
-                    channel_idx,
-                    params,
-                    first_non_dc_bin,
-                    freeze_enabled,
-                    should_update_analyzer_data,
-                )
-            }
-            ThresholdMode::SidechainMatch => {
-                self.update_envelopes(buffer, channel_idx, params, overlap_times);
-                self.measure_match_curve_complex(buffer, channel_idx, params, overlap_times);
-                self.compress_sidechain_match(
-                    buffer,
-                    channel_idx,
-                    params,
-                    first_non_dc_bin,
-                    freeze_enabled,
-                    should_update_analyzer_data,
-                )
+            ThresholdMode::Internal | ThresholdMode::SidechainMatch => {
+                self.measure_match_curve_complex(buffer, channel_idx, params, overlap_times)
             }
             ThresholdMode::SidechainCompress => {
-                // This mode uses regular compression, but the envelopes are computed from the
-                // sidechain input magnitudes. These are already set in `process_sidechain`. This
-                // separate envelope updating function is needed for the channel linking.
-                self.update_envelopes_sidechain(channel_idx, params, overlap_times);
-                self.measure_match_curve_sidechain(channel_idx, params, overlap_times);
-                self.compress(
-                    buffer,
-                    channel_idx,
-                    params,
-                    first_non_dc_bin,
-                    freeze_enabled,
-                    should_update_analyzer_data,
-                )
+                // This mode measures the sidechain signal instead
+                self.measure_match_curve_sidechain(channel_idx, params, overlap_times)
             }
         };
+
+        // Each path follows its own envelope with its own attack and release times, but the
+        // envelope source is still selected by the single transitional mode parameter (Task 4
+        // switches to per-path modes). The timing scale is advanced once per channel pass after
+        // both paths have been updated (see `advance_envelope_timing_scale()`).
+        for (path, path_params) in [
+            (Path::Downwards, &params.thresholds.downwards),
+            (Path::Upwards, &params.thresholds.upwards),
+        ] {
+            let attack_ms =
+                path_params.compressor_attack_ms.value() * self.envelope_followers_timing_scale;
+            let release_ms =
+                path_params.compressor_release_ms.value() * self.envelope_followers_timing_scale;
+
+            match mode {
+                ThresholdMode::Internal | ThresholdMode::SidechainMatch => {
+                    self.update_envelopes(
+                        buffer,
+                        channel_idx,
+                        path,
+                        attack_ms,
+                        release_ms,
+                        overlap_times,
+                    );
+                }
+                ThresholdMode::SidechainCompress => {
+                    // This mode uses regular compression, but the envelopes are computed from the
+                    // sidechain input magnitudes. These are already set in `process_sidechain`.
+                    // This separate envelope updating function is needed for the channel linking.
+                    self.update_envelopes_sidechain(
+                        path,
+                        // Transitional until Task 4: the shared channel link setting drives both paths
+                        params
+                            .thresholds
+                            .downwards
+                            .threshold
+                            .sc_channel_link
+                            .value(),
+                        channel_idx,
+                        attack_ms,
+                        release_ms,
+                        overlap_times,
+                    );
+                }
+            }
+        }
+        self.advance_envelope_timing_scale(channel_idx, overlap_times);
+
+        // Each path compresses its own envelope with its own transfer curve; the raw gain
+        // differences are then summed per bin and smoothed/combined
+        self.compress_path(Path::Downwards, channel_idx, params, mode, first_non_dc_bin);
+        self.compress_path(Path::Upwards, channel_idx, params, mode, first_non_dc_bin);
+        for bin_idx in 0..num_bins {
+            self.combined_raw_gain_difference_db[bin_idx] = self.downwards.raw_gain_difference_db
+                [bin_idx]
+                + self.upwards.raw_gain_difference_db[bin_idx];
+        }
+
+        self.smooth_gain_differences(
+            params.thresholds.downwards.threshold.gain_smoothing.value(),
+            first_non_dc_bin,
+            num_bins,
+        );
+        self.apply_gain_differences(
+            buffer,
+            channel_idx,
+            freeze_enabled,
+            should_update_analyzer_data,
+        );
 
         if freeze_enabled
             && freeze_supported
@@ -1071,16 +1127,20 @@ impl CompressorBank {
                 *gain_difference_db *= channel_multiplier;
             }
 
-            // The spectrum analyzer data has not yet been added
-            assert!(self.envelopes.len() == num_channels);
-            assert!(self.envelopes[0].len() >= num_bins);
+            // The spectrum analyzer data has not yet been added. Transitional until the analyzer
+            // data is split per path: draw the average of the two paths' envelopes.
+            assert!(self.downwards.envelopes.len() == num_channels);
+            assert!(self.downwards.envelopes[0].len() >= num_bins);
             for (bin_idx, spectrum_data) in analyzer_input_data.envelope_followers[..num_bins]
                 .iter_mut()
                 .enumerate()
             {
                 *spectrum_data = 0.0;
                 for channel_idx in 0..num_channels {
-                    *spectrum_data += self.envelopes[channel_idx][bin_idx];
+                    let downwards_envelope = self.downwards.envelopes[channel_idx][bin_idx];
+                    let upwards_envelope = self.upwards.envelopes[channel_idx][bin_idx];
+                    let average = (downwards_envelope + upwards_envelope) * 0.5;
+                    *spectrum_data += average;
                 }
 
                 *spectrum_data *= channel_multiplier;
@@ -1113,55 +1173,32 @@ impl CompressorBank {
         self.update_sidechain_spectra(sc_buffer, channel_idx);
     }
 
-    /// Update the envelope followers based on the bin magnitudes.
+    /// Update the envelope followers for a single compression path from the bin magnitudes in
+    /// `magnitude_bins`. The attack and release times are passed by the caller since they control
+    /// this path's own envelope follower.
     fn update_envelopes(
         &mut self,
-        buffer: &[Complex32],
+        magnitude_bins: &[Complex32],
         channel_idx: usize,
-        params: &SpectralCompressorParams,
+        path: Path,
+        attack_ms: f32,
+        release_ms: f32,
         overlap_times: usize,
     ) {
         let effective_sample_rate =
             self.sample_rate / (self.window_size as f32 / overlap_times as f32);
 
-        // The timings are scaled by `self.envelope_followers_timing_scale` to allow the envelope
-        // followers to settle in quicker after a reset
-        let attack_ms =
-            // FIXME(plan Task 2): per-path envelopes
-            params.thresholds.downwards.compressor_attack_ms.value() * self.envelope_followers_timing_scale;
-        let release_ms =
-            // FIXME(plan Task 2): per-path envelopes
-            params.thresholds.downwards.compressor_release_ms.value() * self.envelope_followers_timing_scale;
+        let (attack_old_t, attack_new_t, release_old_t, release_new_t) =
+            envelope_follower_coefficients(effective_sample_rate, attack_ms, release_ms);
 
-        // This needs to gradually fade from 0.0 back to 1.0 after a reset
-        if self.envelope_followers_timing_scale < 1.0 && channel_idx == self.envelopes.len() - 1 {
-            let delta =
-                ((ENVELOPE_FOLLOWER_TIMING_FADE_MS / 1000.0) * effective_sample_rate).recip();
-            self.envelope_followers_timing_scale =
-                (self.envelope_followers_timing_scale + delta).min(1.0);
-        }
-
-        // The coefficient the old envelope value is multiplied by when the current rectified sample
-        // value is above the envelope's value. The 0 to 1 step response retains 36.8% of the old
-        // value after the attack time has elapsed, and current value is 63.2% of the way towards 1.
-        // The effective sample rate needs to compensate for the periodic nature of the STFT
-        // operation. Since with a 2048 sample window and 4x overlap, you'd run this function once
-        // for every 512 samples.
-        let attack_old_t = if attack_ms == 0.0 {
-            0.0
-        } else {
-            (-1.0 / (attack_ms / 1000.0 * effective_sample_rate)).exp()
+        let path_state = match path {
+            Path::Downwards => &mut self.downwards,
+            Path::Upwards => &mut self.upwards,
         };
-        let attack_new_t = 1.0 - attack_old_t;
-        // The same as `attack_old_t`, but for the release phase of the envelope follower
-        let release_old_t = if release_ms == 0.0 {
-            0.0
-        } else {
-            (-1.0 / (release_ms / 1000.0 * effective_sample_rate)).exp()
-        };
-        let release_new_t = 1.0 - release_old_t;
-
-        for (bin, envelope) in buffer.iter().zip(self.envelopes[channel_idx].iter_mut()) {
+        for (bin, envelope) in magnitude_bins
+            .iter()
+            .zip(path_state.envelopes[channel_idx].iter_mut())
+        {
             let magnitude = bin.norm();
             if *envelope > magnitude {
                 // Release stage
@@ -1179,56 +1216,29 @@ impl CompressorBank {
     /// before this function can be used to set the magnitude spectra.
     fn update_envelopes_sidechain(
         &mut self,
+        path: Path,
+        link_amount: f32,
         channel_idx: usize,
-        params: &SpectralCompressorParams,
+        attack_ms: f32,
+        release_ms: f32,
         overlap_times: usize,
     ) {
         let effective_sample_rate =
             self.sample_rate / (self.window_size as f32 / overlap_times as f32);
 
-        // The timings are scaled by `self.envelope_followers_timing_scale` to allow the envelope
-        // followers to settle in quicker after a reset
-        let attack_ms =
-            // FIXME(plan Task 2): per-path envelopes
-            params.thresholds.downwards.compressor_attack_ms.value() * self.envelope_followers_timing_scale;
-        let release_ms =
-            // FIXME(plan Task 2): per-path envelopes
-            params.thresholds.downwards.compressor_release_ms.value() * self.envelope_followers_timing_scale;
-
-        // This needs to gradually fade from 0.0 back to 1.0 after a reset
-        if self.envelope_followers_timing_scale < 1.0 && channel_idx == self.envelopes.len() - 1 {
-            let delta =
-                ((ENVELOPE_FOLLOWER_TIMING_FADE_MS / 1000.0) * effective_sample_rate).recip();
-            self.envelope_followers_timing_scale =
-                (self.envelope_followers_timing_scale + delta).min(1.0);
-        }
-
-        // See `update_envelopes()`
-        let attack_old_t = if attack_ms == 0.0 {
-            0.0
-        } else {
-            (-1.0 / (attack_ms / 1000.0 * effective_sample_rate)).exp()
-        };
-        let attack_new_t = 1.0 - attack_old_t;
-        let release_old_t = if release_ms == 0.0 {
-            0.0
-        } else {
-            (-1.0 / (release_ms / 1000.0 * effective_sample_rate)).exp()
-        };
-        let release_new_t = 1.0 - release_old_t;
+        let (attack_old_t, attack_new_t, release_old_t, release_new_t) =
+            envelope_follower_coefficients(effective_sample_rate, attack_ms, release_ms);
 
         // For the channel linking
         let num_channels = self.sidechain_spectrum_magnitudes.len() as f32;
-        let other_channels_t = params
-            .thresholds
-            .downwards
-            .threshold
-            .sc_channel_link
-            .value()
-            / num_channels;
+        let other_channels_t = link_amount / num_channels;
         let this_channel_t = 1.0 - (other_channels_t * (num_channels - 1.0));
 
-        for (bin_idx, envelope) in self.envelopes[channel_idx].iter_mut().enumerate() {
+        let path_state = match path {
+            Path::Downwards => &mut self.downwards,
+            Path::Upwards => &mut self.upwards,
+        };
+        for (bin_idx, envelope) in path_state.envelopes[channel_idx].iter_mut().enumerate() {
             // In this mode the envelopes are set based on the sidechain signal, taking channel
             // linking into account
             let sidechain_magnitude: f32 = self
@@ -1253,6 +1263,23 @@ impl CompressorBank {
                 // Attack stage
                 *envelope = (attack_old_t * *envelope) + (attack_new_t * sidechain_magnitude);
             }
+        }
+    }
+
+    /// Slowly fade the envelope follower timing scale back to 1.0 after a reset. Must run once per
+    /// channel pass (not once per path) to keep the legacy timing behaviour.
+    fn advance_envelope_timing_scale(&mut self, channel_idx: usize, overlap_times: usize) {
+        if self.envelope_followers_timing_scale >= 1.0 {
+            return;
+        }
+
+        let effective_sample_rate =
+            self.sample_rate / (self.window_size as f32 / overlap_times as f32);
+        if channel_idx == self.downwards.envelopes.len() - 1 {
+            let delta =
+                ((ENVELOPE_FOLLOWER_TIMING_FADE_MS / 1000.0) * effective_sample_rate).recip();
+            self.envelope_followers_timing_scale =
+                (self.envelope_followers_timing_scale + delta).min(1.0);
         }
     }
 
@@ -1352,257 +1379,194 @@ impl CompressorBank {
         }
     }
 
-    /// Actually do the thing. [`Self::update_envelopes()`] or
-    /// [`Self::update_envelopes_sidechain()`] must have been called before calling this.
+    /// Actually do the thing for a single compression path. [`Self::update_envelopes()`] or
+    /// [`Self::update_envelopes_sidechain()`] must have been called for this path before calling
+    /// this. In sidechain-match mode the path's thresholds and knee values are scaled by the
+    /// sidechain signal. The channel link setting follows the shared transitional read (Task 4
+    /// switches to per-path modes and channel links).
     ///
     /// # Panics
     ///
     /// Panics if the buffer does not have the same length as the one that was passed to the last
     /// `resize()` call.
-    fn compress(
+    fn compress_path(
         &mut self,
-        buffer: &mut [Complex32],
+        path: Path,
         channel_idx: usize,
         params: &SpectralCompressorParams,
+        path_mode: ThresholdMode,
         first_non_dc_bin: usize,
-        freeze_enabled: bool,
-        should_update_analyzer_data: bool,
     ) {
-        let downwards_knee_width_db = params.compressors.downwards.knee_width_db.value();
-        let upwards_knee_width_db = params.compressors.upwards.knee_width_db.value();
+        // Transitional until Task 4: the single (shared) mode parameter drives both paths
+        let mode = path_mode;
+        let knee_width_db = match path {
+            Path::Downwards => params.compressors.downwards.knee_width_db.value(),
+            Path::Upwards => params.compressors.upwards.knee_width_db.value(),
+        };
         let upwards_max_gain_change_db = params.compressors.upwards.max_gain_change_db.value();
+        let num_bins = self.ln_freqs.len();
 
-        assert!(self.downwards.thresholds_db.len() == buffer.len());
-        assert!(self.downwards.ratios.len() == buffer.len());
-        assert!(self.downwards.knee_parabola_scale.len() == buffer.len());
-        assert!(self.downwards.knee_parabola_intercept.len() == buffer.len());
-        assert!(self.upwards.thresholds_db.len() == buffer.len());
-        assert!(self.upwards.ratios.len() == buffer.len());
-        assert!(self.upwards.knee_parabola_scale.len() == buffer.len());
-        assert!(self.upwards.knee_parabola_intercept.len() == buffer.len());
-        assert!(self.frozen_gain_difference_db[channel_idx].len() == buffer.len());
-        assert!(self.raw_gain_difference_db.len() == buffer.len());
-        assert!(self.smoothed_gain_difference_db.len() == buffer.len());
-        // NOTE: In the sidechain compression mode these envelopes are computed from the sidechain
-        //       signal instead of the main input
-        for (bin_idx, envelope) in self.envelopes[channel_idx].iter().enumerate() {
+        assert!(self.downwards.thresholds_db.len() == num_bins);
+        assert!(self.downwards.ratios.len() == num_bins);
+        assert!(self.upwards.thresholds_db.len() == num_bins);
+        assert!(self.upwards.ratios.len() == num_bins);
+        assert!(self.linked_sidechain_magnitudes.len() >= num_bins);
+        assert!(self.combined_raw_gain_difference_db.len() >= num_bins);
+
+        // In sidechain-match mode the compressor thresholds/knee values are scaled by the
+        // sidechain signal, thus sort of creating a dynamic multiband compressor
+        let sidechain = mode == ThresholdMode::SidechainMatch;
+        if sidechain {
+            // For the channel linking. Transitional until Task 4: the shared channel link
+            // setting drives both paths.
+            let num_channels = self.sidechain_spectrum_magnitudes.len() as f32;
+            let other_channels_t = params
+                .thresholds
+                .downwards
+                .threshold
+                .sc_channel_link
+                .value()
+                / num_channels;
+            let this_channel_t = 1.0 - (other_channels_t * (num_channels - 1.0));
+
+            assert!(self.sidechain_spectrum_magnitudes[channel_idx].len() >= num_bins);
+            for (bin_idx, linked_magnitude) in self.linked_sidechain_magnitudes[..num_bins]
+                .iter_mut()
+                .enumerate()
+            {
+                *linked_magnitude = self
+                    .sidechain_spectrum_magnitudes
+                    .iter()
+                    .enumerate()
+                    .map(|(sidechain_channel_idx, magnitudes)| {
+                        let t = if sidechain_channel_idx == channel_idx {
+                            this_channel_t
+                        } else {
+                            other_channels_t
+                        };
+
+                        magnitudes[bin_idx] * t
+                    })
+                    .sum::<f32>()
+                    // The thresholds may never reach zero as they are used in divisions.
+                    .max(f32::EPSILON);
+            }
+        }
+
+        for bin_idx in 0..num_bins {
+            let envelope = match path {
+                Path::Downwards => self.downwards.envelopes[channel_idx][bin_idx],
+                Path::Upwards => self.upwards.envelopes[channel_idx][bin_idx],
+            };
             // Bypass the bin entirely when it is silent (see SILENCE_THRESHOLD_GAIN): with no
             // signal there is nothing to compress. The gain smoother then decays back to
             // baseline during the pause, so the next incoming signal starts from unity gain
-            // instead of inheriting the accumulated (capped) upwards boost.
-            if *envelope <= SILENCE_THRESHOLD_GAIN {
-                self.raw_gain_difference_db[bin_idx] = 0.0;
+            // instead of inheriting the accumulated (capped) upwards boost. In sidechain
+            // compression mode the envelopes are computed from the sidechain signal, so this
+            // gates on the envelope the path itself follows.
+            if envelope <= SILENCE_THRESHOLD_GAIN {
+                match path {
+                    Path::Downwards => self.downwards.raw_gain_difference_db[bin_idx] = 0.0,
+                    Path::Upwards => self.upwards.raw_gain_difference_db[bin_idx] = 0.0,
+                }
                 continue;
             }
 
             // We'll apply the transfer curve to the envelope signal, and then scale the complex
             // `bin` by the gain difference
-            let envelope_db = util::gain_to_db_fast_epsilon(*envelope);
+            let envelope_db = util::gain_to_db_fast_epsilon(envelope);
 
-            let downwards_threshold_db = &self.downwards.thresholds_db[bin_idx];
-            let downwards_ratio = &self.downwards.ratios[bin_idx];
-            let downwards_knee_parabola_scale = &self.downwards.knee_parabola_scale[bin_idx];
-            let downwards_knee_parabola_intercept =
-                &self.downwards.knee_parabola_intercept[bin_idx];
-            let downwards_compressed = compress_downwards(
-                envelope_db,
-                *downwards_threshold_db,
-                *downwards_ratio,
-                downwards_knee_width_db,
-                *downwards_knee_parabola_scale,
-                *downwards_knee_parabola_intercept,
-            );
+            // Notice how the thresholds and knee values are scaled in sidechain-match mode. Because
+            // the thresholds are scaled based on the sidechain input, we also need to recompute the
+            // knee coefficients.
+            let (threshold_db, knee_parabola_scale, knee_parabola_intercept) = if sidechain {
+                let sidechain_scale_db =
+                    util::gain_to_db_fast_epsilon(self.linked_sidechain_magnitudes[bin_idx]);
+                let threshold_db = match path {
+                    Path::Downwards => self.downwards.thresholds_db[bin_idx],
+                    Path::Upwards => self.upwards.thresholds_db[bin_idx],
+                };
+                let threshold_db = (threshold_db + sidechain_scale_db).max(util::MINUS_INFINITY_DB);
+                let ratio = match path {
+                    Path::Downwards => self.downwards.ratios[bin_idx],
+                    Path::Upwards => self.upwards.ratios[bin_idx],
+                };
+                let coefficients = match path {
+                    Path::Downwards => {
+                        downwards_soft_knee_coefficients(threshold_db, knee_width_db, ratio)
+                    }
+                    Path::Upwards => {
+                        upwards_soft_knee_coefficients(threshold_db, knee_width_db, ratio)
+                    }
+                };
 
-            // Upwards compression should not happen when the signal is _too_ quiet as we'd only be
-            // amplifying noise. We also don't want to amplify DC noise and super low frequencies.
-            let upwards_threshold_db = &self.upwards.thresholds_db[bin_idx];
-            let upwards_ratio = &self.upwards.ratios[bin_idx];
-            let upwards_knee_parabola_scale = &self.upwards.knee_parabola_scale[bin_idx];
-            let upwards_knee_parabola_intercept = &self.upwards.knee_parabola_intercept[bin_idx];
-            let upwards_compressed = if bin_idx >= first_non_dc_bin
-                && *upwards_ratio != 1.0
-                && envelope_db > util::MINUS_INFINITY_DB
-            {
-                compress_upwards(
-                    envelope_db,
-                    *upwards_threshold_db,
-                    *upwards_ratio,
-                    upwards_knee_width_db,
-                    *upwards_knee_parabola_scale,
-                    *upwards_knee_parabola_intercept,
-                )
-                // Without this cap the upwards compressor keeps amplifying its slowly
-                // releasing envelope in silence: the release ramps to the -100 dB floor which
-                // sits ever further below the threshold, so the gain difference keeps rising
-                // 'on its own' and spikes when the signal comes back. The gain difference
-                // relative to the envelope is capped since the envelope itself should remain
-                // untouched.
-                .min(envelope_db + upwards_max_gain_change_db)
+                (threshold_db, coefficients.0, coefficients.1)
             } else {
-                envelope_db
+                match path {
+                    Path::Downwards => (
+                        self.downwards.thresholds_db[bin_idx],
+                        self.downwards.knee_parabola_scale[bin_idx],
+                        self.downwards.knee_parabola_intercept[bin_idx],
+                    ),
+                    Path::Upwards => (
+                        self.upwards.thresholds_db[bin_idx],
+                        self.upwards.knee_parabola_scale[bin_idx],
+                        self.upwards.knee_parabola_intercept[bin_idx],
+                    ),
+                }
+            };
+            let ratio = match path {
+                Path::Downwards => self.downwards.ratios[bin_idx],
+                Path::Upwards => self.upwards.ratios[bin_idx],
             };
 
-            // If the compressed output is -10 dBFS and the envelope follower was at -6 dBFS, then we
-            // want to apply -4 dB of gain to the bin
-            self.raw_gain_difference_db[bin_idx] =
-                downwards_compressed + upwards_compressed - (envelope_db * 2.0);
-        }
+            let compressed = match path {
+                // Upwards compression should not happen when the signal is _too_ quiet as we'd
+                // only be amplifying noise. We also don't want to amplify DC noise and super low
+                // frequencies.
+                Path::Upwards
+                    if bin_idx >= first_non_dc_bin
+                        && ratio != 1.0
+                        && envelope_db > util::MINUS_INFINITY_DB =>
+                {
+                    compress_upwards(
+                        envelope_db,
+                        threshold_db,
+                        ratio,
+                        knee_width_db,
+                        knee_parabola_scale,
+                        knee_parabola_intercept,
+                    )
+                    // Without this cap the upwards compressor keeps amplifying its slowly
+                    // releasing envelope in silence: the release ramps to the -100 dB floor which
+                    // sits ever further below the threshold, so the gain difference keeps rising
+                    // 'on its own' and spikes when the signal comes back. The gain difference
+                    // relative to the envelope is capped since the envelope itself should remain
+                    // untouched.
+                    .min(envelope_db + upwards_max_gain_change_db)
+                }
+                Path::Upwards => envelope_db,
+                Path::Downwards => compress_downwards(
+                    envelope_db,
+                    threshold_db,
+                    ratio,
+                    knee_width_db,
+                    knee_parabola_scale,
+                    knee_parabola_intercept,
+                ),
+            };
 
-        self.smooth_gain_differences(
-            params.thresholds.downwards.threshold.gain_smoothing.value(),
-            first_non_dc_bin,
-            buffer.len(),
-        );
-        self.apply_gain_differences(
-            buffer,
-            channel_idx,
-            freeze_enabled,
-            should_update_analyzer_data,
-        );
-    }
-
-    /// The same as [`compress()`][Self::compress()], but multiplying the threshold and knee values
-    /// with the sidechain gains.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the buffer does not have the same length as the one that was passed to the last
-    /// `resize()` call.
-    fn compress_sidechain_match(
-        &mut self,
-        buffer: &mut [Complex32],
-        channel_idx: usize,
-        params: &SpectralCompressorParams,
-        first_non_dc_bin: usize,
-        freeze_enabled: bool,
-        should_update_analyzer_data: bool,
-    ) {
-        let downwards_knee_width_db = params.compressors.downwards.knee_width_db.value();
-        let upwards_knee_width_db = params.compressors.upwards.knee_width_db.value();
-        let upwards_max_gain_change_db = params.compressors.upwards.max_gain_change_db.value();
-
-        // For the channel linking
-        let num_channels = self.sidechain_spectrum_magnitudes.len() as f32;
-        let other_channels_t = params
-            .thresholds
-            .downwards
-            .threshold
-            .sc_channel_link
-            .value()
-            / num_channels;
-        let this_channel_t = 1.0 - (other_channels_t * (num_channels - 1.0));
-
-        assert!(self.sidechain_spectrum_magnitudes[channel_idx].len() == buffer.len());
-        assert!(self.downwards.thresholds_db.len() == buffer.len());
-        assert!(self.downwards.ratios.len() == buffer.len());
-        assert!(self.upwards.thresholds_db.len() == buffer.len());
-        assert!(self.upwards.ratios.len() == buffer.len());
-        assert!(self.frozen_gain_difference_db[channel_idx].len() == buffer.len());
-        assert!(self.linked_sidechain_magnitudes.len() == buffer.len());
-        assert!(self.raw_gain_difference_db.len() == buffer.len());
-        assert!(self.smoothed_gain_difference_db.len() == buffer.len());
-
-        for (bin_idx, linked_magnitude) in self.linked_sidechain_magnitudes.iter_mut().enumerate() {
-            *linked_magnitude = self
-                .sidechain_spectrum_magnitudes
-                .iter()
-                .enumerate()
-                .map(|(sidechain_channel_idx, magnitudes)| {
-                    let t = if sidechain_channel_idx == channel_idx {
-                        this_channel_t
-                    } else {
-                        other_channels_t
-                    };
-
-                    magnitudes[bin_idx] * t
-                })
-                .sum::<f32>()
-                // The thresholds may never reach zero as they are used in divisions.
-                .max(f32::EPSILON);
-        }
-
-        for (bin_idx, envelope) in self.envelopes[channel_idx].iter().enumerate() {
-            // NOTE: These envelopes are computed from the sidechain signal, so the block is
-            //       bypassed entirely when the sidechain input goes silent — the same
-            //       silence-ramp problem as in `compress()` (see SILENCE_THRESHOLD_GAIN)
-            if *envelope <= SILENCE_THRESHOLD_GAIN {
-                self.raw_gain_difference_db[bin_idx] = 0.0;
-                continue;
+            // If the compressed output is -10 dBFS and the envelope follower was at -6 dBFS, then
+            // we want to apply -4 dB of gain to the bin
+            match path {
+                Path::Downwards => {
+                    self.downwards.raw_gain_difference_db[bin_idx] = compressed - envelope_db
+                }
+                Path::Upwards => {
+                    self.upwards.raw_gain_difference_db[bin_idx] = compressed - envelope_db
+                }
             }
-
-            let envelope_db = util::gain_to_db_fast_epsilon(*envelope);
-
-            // The idea here is that we scale the compressor thresholds/knee values by the sidechain
-            // signal, thus sort of creating a dynamic multiband compressor
-            let sidechain_scale = self.linked_sidechain_magnitudes[bin_idx];
-            let sidechain_scale_db = util::gain_to_db_fast_epsilon(sidechain_scale);
-
-            // Notice how the threshold and knee values are scaled here
-            let downwards_threshold_db = (self.downwards.thresholds_db[bin_idx]
-                + sidechain_scale_db)
-                .max(util::MINUS_INFINITY_DB);
-            let downwards_ratio = &self.downwards.ratios[bin_idx];
-            // Because the thresholds are scaled based on the sidechain input, we also need to
-            // recompute the knee coefficients
-            let (downwards_knee_parabola_scale, downwards_knee_parabola_intercept) =
-                downwards_soft_knee_coefficients(
-                    downwards_threshold_db,
-                    downwards_knee_width_db,
-                    *downwards_ratio,
-                );
-            let downwards_compressed = compress_downwards(
-                envelope_db,
-                downwards_threshold_db,
-                *downwards_ratio,
-                downwards_knee_width_db,
-                downwards_knee_parabola_scale,
-                downwards_knee_parabola_intercept,
-            );
-
-            let upwards_threshold_db = (self.upwards.thresholds_db[bin_idx] + sidechain_scale_db)
-                .max(util::MINUS_INFINITY_DB);
-            let upwards_ratio = &self.upwards.ratios[bin_idx];
-            let upwards_compressed = if bin_idx >= first_non_dc_bin
-                && *upwards_ratio != 1.0
-                && envelope_db > util::MINUS_INFINITY_DB
-            {
-                let (upwards_knee_parabola_scale, upwards_knee_parabola_intercept) =
-                    upwards_soft_knee_coefficients(
-                        upwards_threshold_db,
-                        upwards_knee_width_db,
-                        *upwards_ratio,
-                    );
-                compress_upwards(
-                    envelope_db,
-                    upwards_threshold_db,
-                    *upwards_ratio,
-                    upwards_knee_width_db,
-                    upwards_knee_parabola_scale,
-                    upwards_knee_parabola_intercept,
-                )
-                // The same silence-ramp cap as in `compress()`
-                .min(envelope_db + upwards_max_gain_change_db)
-            } else {
-                envelope_db
-            };
-
-            // If the comprssed output is -10 dBFS and the envelope follower was at -6 dBFS, then we
-            // want to apply -4 dB of gain to the bin
-            self.raw_gain_difference_db[bin_idx] =
-                downwards_compressed + upwards_compressed - (envelope_db * 2.0);
         }
-
-        self.smooth_gain_differences(
-            params.thresholds.downwards.threshold.gain_smoothing.value(),
-            first_non_dc_bin,
-            buffer.len(),
-        );
-        self.apply_gain_differences(
-            buffer,
-            channel_idx,
-            freeze_enabled,
-            should_update_analyzer_data,
-        );
     }
 
     fn smooth_gain_differences(
@@ -1611,7 +1575,7 @@ impl CompressorBank {
         first_non_dc_bin: usize,
         num_bins: usize,
     ) {
-        assert!(self.raw_gain_difference_db.len() >= num_bins);
+        assert!(self.combined_raw_gain_difference_db.len() >= num_bins);
         assert!(self.smoothed_gain_difference_db.len() >= num_bins);
         assert!(self.gain_smoothing_prefix_db.len() > num_bins);
         assert!(self.ln_freqs.len() >= num_bins);
@@ -1619,17 +1583,17 @@ impl CompressorBank {
         let smoothing_amount = smoothing_amount.clamp(0.0, 1.0);
         if smoothing_amount <= f32::EPSILON || num_bins <= 2 {
             self.smoothed_gain_difference_db[..num_bins]
-                .copy_from_slice(&self.raw_gain_difference_db[..num_bins]);
+                .copy_from_slice(&self.combined_raw_gain_difference_db[..num_bins]);
             return;
         }
 
         self.gain_smoothing_prefix_db[0] = 0.0;
         for bin_idx in 0..num_bins {
-            self.gain_smoothing_prefix_db[bin_idx + 1] =
-                self.gain_smoothing_prefix_db[bin_idx] + self.raw_gain_difference_db[bin_idx];
+            self.gain_smoothing_prefix_db[bin_idx + 1] = self.gain_smoothing_prefix_db[bin_idx]
+                + self.combined_raw_gain_difference_db[bin_idx];
         }
 
-        self.smoothed_gain_difference_db[0] = self.raw_gain_difference_db[0];
+        self.smoothed_gain_difference_db[0] = self.combined_raw_gain_difference_db[0];
 
         let radius_ln = smoothing_amount * GAIN_SMOOTHING_MAX_RADIUS_LN;
         let mut left_idx = 1;
@@ -1651,7 +1615,7 @@ impl CompressorBank {
                 - self.gain_smoothing_prefix_db[left_idx];
             let count = (right_idx - left_idx + 1) as f32;
             let averaged = sum / count;
-            let raw = self.raw_gain_difference_db[bin_idx];
+            let raw = self.combined_raw_gain_difference_db[bin_idx];
             let mut smoothed = raw + ((averaged - raw) * smoothing_amount);
 
             if bin_idx < first_non_dc_bin && smoothed > 0.0 {
@@ -1852,6 +1816,35 @@ impl CompressorBank {
     }
 }
 
+/// Compute the envelope follower's transfer coefficients for the given attack and release times.
+/// Returns `(attack_old_t, attack_new_t, release_old_t, release_new_t)`. The coefficient the old
+/// envelope value is multiplied by when the current rectified sample value is above the envelope's
+/// value. The 0 to 1 step response retains 36.8% of the old value after the attack time has
+/// elapsed, and the current value is 63.2% of the way towards 1. The effective sample rate needs
+/// to compensate for the periodic nature of the STFT operation. Since with a 2048 sample window
+/// and 4x overlap, you'd run this once for every 512 samples.
+fn envelope_follower_coefficients(
+    effective_sample_rate: f32,
+    attack_ms: f32,
+    release_ms: f32,
+) -> (f32, f32, f32, f32) {
+    let attack_old_t = if attack_ms == 0.0 {
+        0.0
+    } else {
+        (-1.0 / (attack_ms / 1000.0 * effective_sample_rate)).exp()
+    };
+    let attack_new_t = 1.0 - attack_old_t;
+    // The same as `attack_old_t`, but for the release phase of the envelope follower
+    let release_old_t = if release_ms == 0.0 {
+        0.0
+    } else {
+        (-1.0 / (release_ms / 1000.0 * effective_sample_rate)).exp()
+    };
+    let release_new_t = 1.0 - release_old_t;
+
+    (attack_old_t, attack_new_t, release_old_t, release_new_t)
+}
+
 /// Apply downwards compression to the input with the supplied parameters. All values are in
 /// decibels.
 fn compress_downwards(
@@ -2043,6 +2036,162 @@ mod tests {
             .expect("test thread panicked");
     }
 
+    /// Legacy-style envelope update helper: follows the main-input magnitudes for both paths with
+    /// the shared envelope timings (transitional until per-path modes land in Task 4).
+    fn legacy_update_envelopes(
+        bank: &mut CompressorBank,
+        magnitudes: &[Complex32],
+        channel_idx: usize,
+        params: &SpectralCompressorParams,
+        overlap_times: usize,
+    ) {
+        let timing_scale = bank.envelope_followers_timing_scale;
+        let attack_ms = params.thresholds.downwards.compressor_attack_ms.value() * timing_scale;
+        let release_ms = params.thresholds.downwards.compressor_release_ms.value() * timing_scale;
+        bank.update_envelopes(
+            magnitudes,
+            channel_idx,
+            Path::Downwards,
+            attack_ms,
+            release_ms,
+            overlap_times,
+        );
+        bank.update_envelopes(
+            magnitudes,
+            channel_idx,
+            Path::Upwards,
+            attack_ms,
+            release_ms,
+            overlap_times,
+        );
+        bank.advance_envelope_timing_scale(channel_idx, overlap_times);
+    }
+
+    /// Legacy-style compression pass helper: compresses both paths with the shared mode, sums the
+    /// per-path raw gain differences, and runs smoothing and gain application just like `process`.
+    fn legacy_compress_all(
+        bank: &mut CompressorBank,
+        buffer: &mut [Complex32],
+        channel_idx: usize,
+        params: &SpectralCompressorParams,
+        first_non_dc_bin: usize,
+        freeze_enabled: bool,
+        should_update_analyzer_data: bool,
+    ) {
+        let num_bins = buffer.len();
+        let mode = params.thresholds.downwards.threshold.mode.value();
+        bank.compress_path(Path::Downwards, channel_idx, params, mode, first_non_dc_bin);
+        bank.compress_path(Path::Upwards, channel_idx, params, mode, first_non_dc_bin);
+        for bin_idx in 0..num_bins {
+            bank.combined_raw_gain_difference_db[bin_idx] = bank.downwards.raw_gain_difference_db
+                [bin_idx]
+                + bank.upwards.raw_gain_difference_db[bin_idx];
+        }
+        bank.smooth_gain_differences(
+            params.thresholds.downwards.threshold.gain_smoothing.value(),
+            first_non_dc_bin,
+            num_bins,
+        );
+        bank.apply_gain_differences(
+            buffer,
+            channel_idx,
+            freeze_enabled,
+            should_update_analyzer_data,
+        );
+    }
+
+    #[test]
+    fn per_path_attack_release() {
+        run_with_large_stack(|| {
+            let (mut bank, _params, _ir) = make_bank_and_params(1, 64);
+
+            // A signal with a slow attack envelope: 1 ms attack tracks the input quickly, a very
+            // long attack barely moves the envelope from its initial value
+            let magnitudes: Vec<Complex32> = (0..33)
+                .map(|bin_idx| Complex32::new((bin_idx + 1) as f32 * 0.1, 0.0))
+                .collect();
+
+            bank.update_envelopes(&magnitudes, 0, Path::Downwards, 1.0, 1.0, 4);
+            bank.update_envelopes(&magnitudes, 0, Path::Upwards, 100_000.0, 1.0, 4);
+
+            for (down_envelope, up_envelope) in bank.downwards.envelopes[0]
+                .iter()
+                .zip(&bank.upwards.envelopes[0])
+            {
+                assert!(down_envelope > up_envelope);
+            }
+        });
+    }
+
+    #[test]
+    fn legacy_pipeline_matches_two_paths_equally() {
+        run_with_large_stack(|| {
+            let window_size = 64;
+            let num_bins = window_size / 2 + 1;
+            let (mut bank, params, _ir) = make_bank_and_params(1, window_size);
+
+            // Both paths get the same envelope timings and the same (helper-configured)
+            // compressor state, so the per-path pipeline must be exactly the legacy one
+            let buffer = make_complex_buffer(1.0, num_bins);
+            let timing_scale = bank.envelope_followers_timing_scale;
+            let attack_ms = params.thresholds.downwards.compressor_attack_ms.value() * timing_scale;
+            let release_ms =
+                params.thresholds.downwards.compressor_release_ms.value() * timing_scale;
+            bank.update_envelopes(&buffer, 0, Path::Downwards, attack_ms, release_ms, 4);
+            bank.update_envelopes(&buffer, 0, Path::Upwards, attack_ms, release_ms, 4);
+
+            bank.compress_path(Path::Downwards, 0, &params, ThresholdMode::Internal, 1);
+            bank.compress_path(Path::Upwards, 0, &params, ThresholdMode::Internal, 1);
+            for bin_idx in 0..num_bins {
+                bank.combined_raw_gain_difference_db[bin_idx] =
+                    bank.downwards.raw_gain_difference_db[bin_idx]
+                        + bank.upwards.raw_gain_difference_db[bin_idx];
+            }
+            bank.smooth_gain_differences(
+                params.thresholds.downwards.threshold.gain_smoothing.value(),
+                1,
+                num_bins,
+            );
+
+            // The legacy formula: one shared envelope, both curves applied to it, summed. The
+            // per-path envelopes are equal so they double as the legacy envelope
+            let knee_width_db = params.compressors.downwards.knee_width_db.value();
+            let reference: Vec<f32> = (0..num_bins)
+                .map(|bin_idx| {
+                    let envelope_db =
+                        util::gain_to_db_fast_epsilon(bank.downwards.envelopes[0][bin_idx]);
+                    let downwards_compressed = compress_downwards(
+                        envelope_db,
+                        bank.downwards.thresholds_db[bin_idx],
+                        bank.downwards.ratios[bin_idx],
+                        knee_width_db,
+                        bank.downwards.knee_parabola_scale[bin_idx],
+                        bank.downwards.knee_parabola_intercept[bin_idx],
+                    );
+                    let upwards_compressed = if bin_idx >= 1
+                        && bank.upwards.ratios[bin_idx] != 1.0
+                        && envelope_db > util::MINUS_INFINITY_DB
+                    {
+                        compress_upwards(
+                            envelope_db,
+                            bank.upwards.thresholds_db[bin_idx],
+                            bank.upwards.ratios[bin_idx],
+                            knee_width_db,
+                            bank.upwards.knee_parabola_scale[bin_idx],
+                            bank.upwards.knee_parabola_intercept[bin_idx],
+                        )
+                    } else {
+                        envelope_db
+                    };
+
+                    downwards_compressed + upwards_compressed - (envelope_db * 2.0)
+                })
+                .collect();
+
+            assert_slice_near(&bank.smoothed_gain_difference_db[..num_bins], &reference);
+        });
+    }
+
     #[test]
     fn update_if_needed_touches_only_flagged_path() {
         run_with_large_stack(|| {
@@ -2168,7 +2317,7 @@ mod tests {
         let raw: Vec<f32> = (0..num_bins)
             .map(|bin_idx| (bin_idx as f32 % 5.0) - 8.0)
             .collect();
-        compressor_bank.raw_gain_difference_db[..num_bins].copy_from_slice(&raw);
+        compressor_bank.combined_raw_gain_difference_db[..num_bins].copy_from_slice(&raw);
 
         compressor_bank.smooth_gain_differences(0.0, 1, num_bins);
 
@@ -2184,8 +2333,8 @@ mod tests {
         let num_bins = window_size / 2 + 1;
         let (mut compressor_bank, _params, _frozen_ir_output_data) =
             make_bank_and_params(1, window_size);
-        compressor_bank.raw_gain_difference_db[..num_bins].fill(0.0);
-        compressor_bank.raw_gain_difference_db[16] = -24.0;
+        compressor_bank.combined_raw_gain_difference_db[..num_bins].fill(0.0);
+        compressor_bank.combined_raw_gain_difference_db[16] = -24.0;
 
         compressor_bank.smooth_gain_differences(1.0, 1, num_bins);
 
@@ -2201,7 +2350,7 @@ mod tests {
         let num_bins = window_size / 2 + 1;
         let (mut compressor_bank, _params, _frozen_ir_output_data) =
             make_bank_and_params(1, window_size);
-        compressor_bank.raw_gain_difference_db[..num_bins].fill(-6.0);
+        compressor_bank.combined_raw_gain_difference_db[..num_bins].fill(-6.0);
 
         compressor_bank.smooth_gain_differences(1.0, 1, num_bins);
 
@@ -2231,15 +2380,112 @@ mod tests {
 
         // A silent spectrum: all bins at -100 dBFS
         let mut buffer = make_complex_buffer(1.0e-5, num_bins);
-        compressor_bank.update_envelopes(&buffer, 0, &params, 4);
-        compressor_bank.compress(&mut buffer, 0, &params, 1, false, false);
+        legacy_update_envelopes(&mut compressor_bank, &buffer, 0, &params, 4);
+        legacy_compress_all(
+            &mut compressor_bank,
+            &mut buffer,
+            0,
+            &params,
+            1,
+            false,
+            false,
+        );
 
-        assert!(compressor_bank.raw_gain_difference_db[..num_bins]
+        assert!(compressor_bank.combined_raw_gain_difference_db[..num_bins]
             .iter()
             .all(|raw| *raw == 0.0));
         assert!(compressor_bank.smoothed_gain_difference_db[..num_bins]
             .iter()
             .all(|gain| gain.abs() < 1.0e-5));
+    }
+
+    /// A silent main input must not bypass the sidechain-compression path: that path follows the
+    /// sidechain signal, so its envelope gate has to use the path's own envelope (which tracks
+    /// the sidechain), not the main input's magnitudes.
+    #[test]
+    fn silent_main_input_does_not_bypass_sidechain_compress_path() {
+        run_with_large_stack(|| {
+            let window_size = 64;
+            let num_bins = window_size / 2 + 1;
+            let (mut bank, params, _ir) = make_bank_and_params(1, window_size);
+            configure_test_downwards_compression(&mut bank, 0.0, 1.0, 0.0);
+            // Strong upwards compression: threshold +6 dBFS, 4:1 ratio, 6 dB knee. The sidechain
+            // magnitudes are all below this threshold, so every bin gets boosted.
+            let (knee_scale, knee_intercept) = upwards_soft_knee_coefficients(6.0, 6.0, 4.0);
+            bank.upwards.thresholds_db.fill(6.0);
+            bank.upwards.ratios.fill(4.0);
+            bank.upwards.knee_parabola_scale.fill(knee_scale);
+            bank.upwards.knee_parabola_intercept.fill(knee_intercept);
+
+            // The main input is silent while the sidechain is quiet-but-alive: the downwards
+            // path (Internal) follows the silent main input, the upwards path
+            // (SidechainCompress) follows the sidechain signal
+            let silent = make_complex_buffer(1.0e-5, num_bins);
+            let sidechain = make_complex_buffer(0.05, num_bins);
+            bank.process_sidechain(&sidechain, 0);
+
+            // Follow the sidechain for both paths many times so the envelopes converge and the
+            // attack time's slow fade-in does not skew the values
+            let timing_scale = bank.envelope_followers_timing_scale;
+            let downwards_attack_ms =
+                params.thresholds.downwards.compressor_attack_ms.value() * timing_scale;
+            let downwards_release_ms =
+                params.thresholds.downwards.compressor_release_ms.value() * timing_scale;
+            let upwards_attack_ms =
+                params.thresholds.upwards.compressor_attack_ms.value() * timing_scale;
+            let upwards_release_ms =
+                params.thresholds.upwards.compressor_release_ms.value() * timing_scale;
+            for _ in 0..200 {
+                bank.update_envelopes(
+                    &silent,
+                    0,
+                    Path::Downwards,
+                    downwards_attack_ms,
+                    downwards_release_ms,
+                    4,
+                );
+                bank.update_envelopes_sidechain(
+                    Path::Upwards,
+                    0.0,
+                    0,
+                    upwards_attack_ms,
+                    upwards_release_ms,
+                    4,
+                );
+            }
+            bank.advance_envelope_timing_scale(0, 4);
+
+            bank.compress_path(Path::Downwards, 0, &params, ThresholdMode::Internal, 1);
+            bank.compress_path(
+                Path::Upwards,
+                0,
+                &params,
+                ThresholdMode::SidechainCompress,
+                1,
+            );
+
+            // The downwards path is fully gated by the silent main input, but the upwards path
+            // must not be: it follows the sidechain, so every non-DC bin gets compressed
+            eprintln!(
+                "DBG env1={} db={} thr={} ratio={} raw1={}",
+                bank.upwards.envelopes[0][1],
+                nih_plug::util::gain_to_db_fast_epsilon(bank.upwards.envelopes[0][1]),
+                bank.upwards.thresholds_db[1],
+                bank.upwards.ratios[1],
+                bank.upwards.raw_gain_difference_db[1]
+            );
+            assert!(bank
+                .downwards
+                .raw_gain_difference_db
+                .iter()
+                .all(|raw| *raw == 0.0));
+            for bin_idx in 1..num_bins {
+                assert!(
+                    bank.upwards.raw_gain_difference_db[bin_idx] != 0.0,
+                    "upwards gain difference is zero at bin {bin_idx}"
+                );
+            }
+        });
     }
 
     #[test]
@@ -2248,9 +2494,9 @@ mod tests {
         let num_bins = window_size / 2 + 1;
         let (mut compressor_bank, _params, _frozen_ir_output_data) =
             make_bank_and_params(1, window_size);
-        compressor_bank.raw_gain_difference_db[..num_bins].fill(0.0);
-        compressor_bank.raw_gain_difference_db[3] = 18.0;
-        compressor_bank.raw_gain_difference_db[4] = 18.0;
+        compressor_bank.combined_raw_gain_difference_db[..num_bins].fill(0.0);
+        compressor_bank.combined_raw_gain_difference_db[3] = 18.0;
+        compressor_bank.combined_raw_gain_difference_db[4] = 18.0;
 
         compressor_bank.smooth_gain_differences(1.0, 4, num_bins);
 
@@ -2266,8 +2512,8 @@ mod tests {
         let num_bins = window_size / 2 + 1;
         let (mut compressor_bank, _params, _frozen_ir_output_data) =
             make_bank_and_params(1, window_size);
-        compressor_bank.raw_gain_difference_db[..num_bins].fill(0.0);
-        compressor_bank.raw_gain_difference_db[16] = -24.0;
+        compressor_bank.combined_raw_gain_difference_db[..num_bins].fill(0.0);
+        compressor_bank.combined_raw_gain_difference_db[16] = -24.0;
         compressor_bank.smooth_gain_differences(1.0, 1, num_bins);
         let smoothed_snapshot = compressor_bank.smoothed_gain_difference_db[..num_bins].to_vec();
         let mut buffer = make_complex_buffer(1.0, num_bins);
@@ -2281,7 +2527,7 @@ mod tests {
         );
         assert_ne!(
             compressor_bank.frozen_gain_difference_db[0][16],
-            compressor_bank.raw_gain_difference_db[16]
+            compressor_bank.combined_raw_gain_difference_db[16]
         );
     }
 
@@ -2294,14 +2540,30 @@ mod tests {
                 make_bank_and_params(1, window_size);
 
             let mut warmup = make_complex_buffer(1.0, num_bins);
-            compressor_bank.update_envelopes(&warmup, 0, &params, 4);
-            compressor_bank.compress(&mut warmup, 0, &params, 1, false, true);
+            legacy_update_envelopes(&mut compressor_bank, &warmup, 0, &params, 4);
+            legacy_compress_all(
+                &mut compressor_bank,
+                &mut warmup,
+                0,
+                &params,
+                1,
+                false,
+                true,
+            );
             assert!(!compressor_bank.frozen_gain_snapshot_valid[0]);
 
             compressor_bank.sync_freeze_state(true);
             let mut capture = make_complex_buffer(2.0, num_bins);
-            compressor_bank.update_envelopes(&capture, 0, &params, 4);
-            compressor_bank.compress(&mut capture, 0, &params, 1, true, true);
+            legacy_update_envelopes(&mut compressor_bank, &capture, 0, &params, 4);
+            legacy_compress_all(
+                &mut compressor_bank,
+                &mut capture,
+                0,
+                &params,
+                1,
+                true,
+                true,
+            );
 
             assert!(compressor_bank.frozen_gain_snapshot_valid[0]);
             assert!(compressor_bank.frozen_gain_difference_db[0]
@@ -2323,16 +2585,24 @@ mod tests {
             compressor_bank.process_sidechain(&sidechain_a, 0);
             compressor_bank.sync_freeze_state(true);
             let mut capture = make_complex_buffer(3.0, num_bins);
-            compressor_bank.update_envelopes(&capture, 0, &params, 4);
-            compressor_bank.compress_sidechain_match(&mut capture, 0, &params, 1, true, true);
+            legacy_update_envelopes(&mut compressor_bank, &capture, 0, &params, 4);
+            legacy_compress_all(
+                &mut compressor_bank,
+                &mut capture,
+                0,
+                &params,
+                1,
+                true,
+                true,
+            );
             let frozen_snapshot = compressor_bank.frozen_gain_difference_db[0].clone();
 
             let sidechain_b = make_complex_buffer(0.1, num_bins);
             compressor_bank.process_sidechain(&sidechain_b, 0);
             let input_before = make_complex_buffer(0.25, num_bins);
             let mut held = input_before.clone();
-            compressor_bank.update_envelopes(&held, 0, &params, 4);
-            compressor_bank.compress_sidechain_match(&mut held, 0, &params, 1, true, true);
+            legacy_update_envelopes(&mut compressor_bank, &held, 0, &params, 4);
+            legacy_compress_all(&mut compressor_bank, &mut held, 0, &params, 1, true, true);
 
             assert_eq!(
                 compressor_bank.frozen_gain_difference_db[0],
@@ -2354,23 +2624,39 @@ mod tests {
 
             compressor_bank.sync_freeze_state(true);
             let mut first_capture = make_complex_buffer(2.0, num_bins);
-            compressor_bank.update_envelopes(&first_capture, 0, &params, 4);
-            compressor_bank.compress(&mut first_capture, 0, &params, 1, true, true);
+            legacy_update_envelopes(&mut compressor_bank, &first_capture, 0, &params, 4);
+            legacy_compress_all(
+                &mut compressor_bank,
+                &mut first_capture,
+                0,
+                &params,
+                1,
+                true,
+                true,
+            );
             let snapshot_a = compressor_bank.frozen_gain_difference_db[0].clone();
             compressor_bank.publish_frozen_ir_snapshot(4);
             assert!(frozen_ir_output_data.read().valid);
 
             compressor_bank.sync_freeze_state(false);
             let mut live = make_complex_buffer(0.3, num_bins);
-            compressor_bank.update_envelopes(&live, 0, &params, 4);
-            compressor_bank.compress(&mut live, 0, &params, 1, false, true);
+            legacy_update_envelopes(&mut compressor_bank, &live, 0, &params, 4);
+            legacy_compress_all(&mut compressor_bank, &mut live, 0, &params, 1, false, true);
             assert!(!compressor_bank.frozen_gain_snapshot_valid[0]);
             assert!(!frozen_ir_output_data.read().valid);
 
             compressor_bank.sync_freeze_state(true);
             let mut second_capture = make_complex_buffer(6.0, num_bins);
-            compressor_bank.update_envelopes(&second_capture, 0, &params, 4);
-            compressor_bank.compress(&mut second_capture, 0, &params, 1, true, true);
+            legacy_update_envelopes(&mut compressor_bank, &second_capture, 0, &params, 4);
+            legacy_compress_all(
+                &mut compressor_bank,
+                &mut second_capture,
+                0,
+                &params,
+                1,
+                true,
+                true,
+            );
             let snapshot_b = compressor_bank.frozen_gain_difference_db[0].clone();
             compressor_bank.publish_frozen_ir_snapshot(4);
 
@@ -2390,8 +2676,16 @@ mod tests {
 
             compressor_bank.sync_freeze_state(true);
             let mut capture = make_complex_buffer(2.5, num_bins);
-            compressor_bank.update_envelopes(&capture, 0, &params, 4);
-            compressor_bank.compress(&mut capture, 0, &params, 1, true, true);
+            legacy_update_envelopes(&mut compressor_bank, &capture, 0, &params, 4);
+            legacy_compress_all(
+                &mut compressor_bank,
+                &mut capture,
+                0,
+                &params,
+                1,
+                true,
+                true,
+            );
             assert!(compressor_bank.frozen_gain_snapshot_valid[0]);
             compressor_bank.publish_frozen_ir_snapshot(4);
             assert!(frozen_ir_output_data.read().valid);
@@ -2405,8 +2699,16 @@ mod tests {
 
             compressor_bank.sync_freeze_state(true);
             let mut recapture = make_complex_buffer(4.0, num_bins);
-            compressor_bank.update_envelopes(&recapture, 0, &params, 4);
-            compressor_bank.compress(&mut recapture, 0, &params, 1, true, true);
+            legacy_update_envelopes(&mut compressor_bank, &recapture, 0, &params, 4);
+            legacy_compress_all(
+                &mut compressor_bank,
+                &mut recapture,
+                0,
+                &params,
+                1,
+                true,
+                true,
+            );
             assert!(compressor_bank.frozen_gain_snapshot_valid[0]);
             compressor_bank.publish_frozen_ir_snapshot(4);
             assert!(frozen_ir_output_data.read().valid);
@@ -2432,8 +2734,16 @@ mod tests {
 
             compressor_bank.sync_freeze_state(true);
             let mut capture = make_complex_buffer(3.5, num_bins);
-            compressor_bank.update_envelopes(&capture, 0, &params, 4);
-            compressor_bank.compress(&mut capture, 0, &params, 1, true, true);
+            legacy_update_envelopes(&mut compressor_bank, &capture, 0, &params, 4);
+            legacy_compress_all(
+                &mut compressor_bank,
+                &mut capture,
+                0,
+                &params,
+                1,
+                true,
+                true,
+            );
             compressor_bank.publish_frozen_ir_snapshot(4);
 
             let snapshot = frozen_ir_output_data.read().clone();
@@ -2455,8 +2765,16 @@ mod tests {
 
             compressor_bank.sync_freeze_state(true);
             let mut capture = make_complex_buffer(3.0, num_bins);
-            compressor_bank.update_envelopes(&capture, 0, &params, 4);
-            compressor_bank.compress(&mut capture, 0, &params, 1, true, true);
+            legacy_update_envelopes(&mut compressor_bank, &capture, 0, &params, 4);
+            legacy_compress_all(
+                &mut compressor_bank,
+                &mut capture,
+                0,
+                &params,
+                1,
+                true,
+                true,
+            );
             compressor_bank.publish_frozen_ir_snapshot(4);
             assert!(frozen_ir_output_data.read().valid);
 
