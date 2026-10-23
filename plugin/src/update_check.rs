@@ -49,7 +49,7 @@ pub fn version_is_newer(latest_tag: &str, running: &str) -> bool {
 
 /// The GitHub page the strip's button opens.
 pub const RELEASES_LATEST_PAGE_URL: &str =
-    "https://github.com/resname/plugin.nih.polarity-sc-AUv3/releases/latest";
+    "https://github.com/resname/resname-spectral-compressor-AUv3/releases/latest";
 
 /// The latest release found in the response body of a `releases/latest`
 /// lookup.
@@ -78,7 +78,7 @@ fn parse_release_json(json: &str, running_version: &str) -> Option<LatestRelease
 }
 
 const LATEST_RELEASE_API_URL: &str =
-    "https://api.github.com/repos/resname/plugin.nih.polarity-sc-AUv3/releases/latest";
+    "https://api.github.com/repos/resname/resname-spectral-compressor-AUv3/releases/latest";
 
 /// Performs the update check: one GET against `releases/latest`, `None` on any
 /// failure (offline, non-200, malformed, not newer). No retry, no pagination.
