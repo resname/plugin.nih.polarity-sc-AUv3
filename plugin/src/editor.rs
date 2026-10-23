@@ -147,9 +147,11 @@ impl ExportUiModel {
 }
 
 enum CurvePresetEvent {
-    Apply(usize),
-    SaveRequested,
-    SaveDialogFinished(Option<PathBuf>),
+    // The path field records which column the picklist/button lives in: presets are
+    // applied to that path's curve only, since the analyzer edits per-path curves.
+    Apply(usize, CompressionPath),
+    SaveRequested(CompressionPath),
+    SaveDialogFinished(Option<PathBuf>, CompressionPath),
     DeleteSelected,
 }
 
@@ -161,18 +163,20 @@ enum CurvePresetButtonAction {
 
 struct CurvePresetButton {
     action: CurvePresetButtonAction,
+    path: CompressionPath,
 }
 
 impl CurvePresetButton {
     fn new<T>(
         cx: &mut Context,
         action: CurvePresetButtonAction,
+        path: CompressionPath,
         label: impl Res<T> + Clone,
     ) -> Handle<'_, Self>
     where
         T: ToString,
     {
-        Self { action }
+        Self { action, path }
             .build(cx, |cx| {
                 Label::new(cx, label).hoverable(false);
             })
@@ -197,7 +201,7 @@ impl View for CurvePresetButton {
 
                 match self.action {
                     CurvePresetButtonAction::SaveRequested => {
-                        cx.emit(CurvePresetEvent::SaveRequested)
+                        cx.emit(CurvePresetEvent::SaveRequested(self.path))
                     }
                     CurvePresetButtonAction::DeleteSelected => {
                         cx.emit(CurvePresetEvent::DeleteSelected)
@@ -276,7 +280,7 @@ impl Model for ExportUiModel {
 
         event.map(
             |curve_preset_event: &CurvePresetEvent, _meta| match curve_preset_event {
-                CurvePresetEvent::Apply(index) => {
+                CurvePresetEvent::Apply(index, path) => {
                     if *index == 0 {
                         return;
                     }
@@ -284,7 +288,7 @@ impl Model for ExportUiModel {
                     if let Some(entry) = self.curve_preset_entries.get(index - 1) {
                         let preset = entry.preset.clone();
                         let source = entry.source;
-                        self.apply_curve_preset(preset.clone(), source);
+                        self.apply_curve_preset(preset.clone(), source, *path);
                         self.selected_curve_preset_index = *index;
                         self.refresh_curve_preset_delete_enabled();
                         cx.emit(RawParamEvent::ParametersChanged);
@@ -292,7 +296,9 @@ impl Model for ExportUiModel {
                         self.refresh_export_availability();
                     }
                 }
-                CurvePresetEvent::SaveRequested => {
+                CurvePresetEvent::SaveRequested(path) => {
+                    let path = *path;
+
                     let Some(dir) = user_preset_dir() else {
                         self.status_text = String::from("Could not find preset folder");
                         return;
@@ -300,17 +306,18 @@ impl Model for ExportUiModel {
 
                     self.status_text = String::from("Choose preset name...");
                     cx.spawn(move |proxy| {
-                        let path = prompt_for_curve_preset_path(&dir);
-                        let _ = proxy.emit(CurvePresetEvent::SaveDialogFinished(path));
+                        let path_from_dialog = prompt_for_curve_preset_path(&dir);
+                        let _ =
+                            proxy.emit(CurvePresetEvent::SaveDialogFinished(path_from_dialog, path));
                     });
                 }
-                CurvePresetEvent::SaveDialogFinished(path) => {
+                CurvePresetEvent::SaveDialogFinished(path, save_path) => {
                     let Some(path) = path else {
                         self.status_text = String::new();
                         return;
                     };
 
-                    let preset = self.current_curve_preset();
+                    let preset = self.current_curve_preset(*save_path);
                     match save_user_preset_to_path(path, preset) {
                         Ok(entry) => {
                             self.upsert_user_preset(entry);
@@ -468,8 +475,11 @@ fn css_modified_at(css_path: &PathBuf) -> Option<SystemTime> {
 }
 
 impl ExportUiModel {
-    fn current_curve_preset(&self) -> CurvePreset {
-        let threshold = &self.params.thresholds.downwards.threshold;
+    fn current_curve_preset(&self, path: CompressionPath) -> CurvePreset {
+        let threshold = match path {
+            CompressionPath::Downwards => &self.params.thresholds.downwards.threshold,
+            CompressionPath::Upwards => &self.params.thresholds.upwards.threshold,
+        };
 
         CurvePreset {
             name: String::new(),
@@ -526,14 +536,16 @@ impl ExportUiModel {
             .unwrap_or(0);
     }
 
-    fn apply_curve_preset(&self, preset: CurvePreset, source: CurvePresetSource) {
+    fn apply_curve_preset(&self, preset: CurvePreset, source: CurvePresetSource, path: CompressionPath) {
         let setter = ParamSetter::new(self.gui_context.as_ref());
 
-        // The curve is shared between both paths, so a preset writes both curves identically
-        for threshold in [
-            &self.params.thresholds.downwards.threshold,
-            &self.params.thresholds.upwards.threshold,
-        ] {
+        // The analyzer edits each path's curve separately, so a preset only writes the
+        // curve of the path whose column it was picked on.
+        let threshold = match path {
+            CompressionPath::Downwards => &self.params.thresholds.downwards.threshold,
+            CompressionPath::Upwards => &self.params.thresholds.upwards.threshold,
+        };
+        {
             setter.begin_set_parameter(&threshold.threshold_db);
             setter.set_parameter(&threshold.threshold_db, preset.threshold_db);
             setter.end_set_parameter(&threshold.threshold_db);
@@ -971,11 +983,21 @@ fn path_column(cx: &mut Context, path: CompressionPath) {
                 HStack::new(cx, |cx| {
                     Label::new(cx, "Curve Presets").class("label");
                     HStack::new(cx, |cx| {
-                        curve_preset_picklist(cx);
-                        CurvePresetButton::new(cx, CurvePresetButtonAction::SaveRequested, "Save")
-                            .class("curve-preset-button");
-                        CurvePresetButton::new(cx, CurvePresetButtonAction::DeleteSelected, "Del")
-                            .disabled(
+                        curve_preset_picklist(cx, path);
+                        CurvePresetButton::new(
+                            cx,
+                            CurvePresetButtonAction::SaveRequested,
+                            path,
+                            "Save",
+                        )
+                        .class("curve-preset-button");
+                        CurvePresetButton::new(
+                            cx,
+                            CurvePresetButtonAction::DeleteSelected,
+                            path,
+                            "Del",
+                        )
+                        .disabled(
                                 ExportUiModel::can_delete_curve_preset
                                     .map(|can_delete| !*can_delete),
                             )
@@ -1121,7 +1143,7 @@ fn curve_preset_options(entries: &[CurvePresetEntry]) -> Vec<String> {
     options
 }
 
-fn curve_preset_picklist(cx: &mut Context) {
+fn curve_preset_picklist(cx: &mut Context, path: CompressionPath) {
     PickList::new(
         cx,
         ExportUiModel::curve_preset_options,
@@ -1135,12 +1157,12 @@ fn curve_preset_picklist(cx: &mut Context) {
             "Threshold curve presets change the displayed threshold curve shape.",
         );
     })
-    .on_select(|cx, index| {
+    .on_select(move |cx, index| {
         if index == 0 {
             return;
         }
 
-        cx.emit(CurvePresetEvent::Apply(index));
+        cx.emit(CurvePresetEvent::Apply(index, path));
     });
 }
 
