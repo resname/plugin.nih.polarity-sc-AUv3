@@ -616,8 +616,8 @@ static MIDIPortRef sMIDIInputPort = 0;
   }
   else
   {
-    std::cout << "[auv3-standalone] Engine started. Sample rate: " << outputFormat.sampleRate << " Hz"
-              << std::endl;
+    std::cout << "[auv3-standalone] Engine started. Sample rate: "
+              << [_engine.outputNode inputFormatForBus:0].sampleRate << " Hz" << std::endl;
   }
 }
 
