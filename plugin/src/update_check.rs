@@ -46,6 +46,64 @@ pub fn version_is_newer(latest_tag: &str, running: &str) -> bool {
     latest > running
 }
 
+/// The plugin's origin repo. Releases are published only here; the API
+/// endpoint and the button below are hardcoded to it.
+const REPO: &str = "resname/plugin.nih.polarity-sc-AUv3";
+
+/// The GitHub page the strip's button opens.
+pub const RELEASES_LATEST_PAGE_URL: &str =
+    "https://github.com/resname/plugin.nih.polarity-sc-AUv3/releases/latest";
+
+/// The latest release found in the response body of a `releases/latest`
+/// lookup.
+#[derive(Clone, Debug)]
+pub struct LatestRelease {
+    pub tag: String,
+    pub version: (u64, u64, u64),
+    pub page_url: String,
+}
+
+/// Extracts `tag_name`/`html_url` from a single `releases/latest` response
+/// body and returns it only when its version is strictly newer than the
+/// running version.
+fn parse_release_json(json: &str, running_version: &str) -> Option<LatestRelease> {
+    let body = serde_json::from_str::<serde_json::Value>(json).ok()?;
+    let tag = body.get("tag_name")?.as_str()?.to_owned();
+    let version = parse_version_tag(&tag)?;
+    if !version_is_newer(&tag, running_version) {
+        return None;
+    }
+
+    let page_url = body
+        .get("html_url")?
+        .as_str()?
+        .to_owned();
+
+    Some(LatestRelease {
+        tag,
+        version,
+        page_url,
+    })
+}
+
+const LATEST_RELEASE_API_URL: &str =
+    "https://api.github.com/repos/resname/plugin.nih.polarity-sc-AUv3/releases/latest";
+
+/// Performs the update check: one GET against `releases/latest`, `None` on any
+/// failure (offline, non-200, malformed, not newer). No retry, no pagination.
+pub fn fetch_latest_release(running_version: &str) -> Option<LatestRelease> {
+    let mut response = ureq::get(LATEST_RELEASE_API_URL)
+        .header(
+            "User-Agent",
+            concat!("SpectralCompressor-", env!("CARGO_PKG_VERSION")),
+        )
+        .call()
+        .ok()?;
+    let json = response.body_mut().read_to_string().ok()?;
+
+    parse_release_json(&json, running_version)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,5 +137,23 @@ mod tests {
         assert!(!version_is_newer("v0.5.9", "0.6.0"));
         assert!(!version_is_newer("notaversion", "0.6.0"));
         assert!(version_is_newer("v1", "0.99.99"));
+    }
+
+    #[test]
+    fn parse_release_json_extracts_tag_and_url() {
+        let json = r#"{"tag_name":"v0.7.0","html_url":"https://github.com/resname/plugin.nih.polarity-sc-AUv3/releases/tag/v0.7.0"}"#;
+        let release = parse_release_json(json, "0.6.0").expect("should parse");
+        assert_eq!(release.tag, "v0.7.0");
+        assert_eq!(release.version, (0, 7, 0));
+        assert_eq!(
+            release.page_url,
+            "https://github.com/resname/plugin.nih.polarity-sc-AUv3/releases/tag/v0.7.0"
+        );
+    }
+
+    #[test]
+    fn parse_release_json_older_is_none() {
+        let json = r#"{"tag_name":"v0.6.0","html_url":"https://github.com/x/y/releases/tag/v0.6.0"}"#;
+        assert!(parse_release_json(json, "0.6.0").is_none());
     }
 }
