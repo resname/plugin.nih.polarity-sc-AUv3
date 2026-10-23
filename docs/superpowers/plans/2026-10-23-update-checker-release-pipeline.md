@@ -74,6 +74,7 @@ fn version_is_newer_strictly_greater() {
     assert!(!version_is_newer("notaversion", "0.6.0"));
     assert!(version_is_newer("v1", "0.99.99"));
 }
+```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 

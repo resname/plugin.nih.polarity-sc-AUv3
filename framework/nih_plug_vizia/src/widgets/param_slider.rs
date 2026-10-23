@@ -592,14 +592,13 @@ impl View for ParamSlider {
                         // The fallback `get_or_insert` should never trigger mid-drag since the
                         // grab point is stored at mouse down; if a drag was started some other
                         // way this lazily anchors at the first move event instead.
-                        let grab_status = *self
-                            .drag_grab_status
-                            .get_or_insert_with(|| GranularDragStatus {
-                                starting_x_coordinate: *x,
-                                starting_value: self
-                                    .param_base
-                                    .unmodulated_normalized_value(),
-                            });
+                        let grab_status =
+                            *self
+                                .drag_grab_status
+                                .get_or_insert_with(|| GranularDragStatus {
+                                    starting_x_coordinate: *x,
+                                    starting_value: self.param_base.unmodulated_normalized_value(),
+                                });
                         let start_x =
                             util::remap_current_entity_x_t(cx, grab_status.starting_value);
                         // A 1:1 mapping: dragging the mouse by one pixel moves the bar by one

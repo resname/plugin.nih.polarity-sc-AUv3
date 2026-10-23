@@ -35,6 +35,7 @@ mod editor;
 mod frozen_ir;
 mod match_curve;
 mod match_level;
+mod update_check;
 
 use crate::compressor_bank::ThresholdMode;
 use crate::match_curve::MatchCurveRuntime;

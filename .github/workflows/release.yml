@@ -1,0 +1,176 @@
+# Tag-triggered release pipeline: builds the VST3 and CLAP bundles on all
+# three platforms and attaches them as assets to the GitHub Release for the
+# tag. Unsigned builds; the AUv3 lives in `.github/workflows/auv3.yml` and the
+# manual multi-platform build in `build.yml`.
+name: Release plugin binaries
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    # GitHub's default sh on Linux does not support the array syntax below.
+    shell: bash
+
+jobs:
+  package:
+    name: Package ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-22.04
+            cross-target: ""
+          - name: macOS-universal
+            os: macos-latest
+            cross-target: x86_64-apple-darwin
+          - name: Windows
+            os: windows-latest
+            cross-target: ""
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install Linux dependencies
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev \
+            libgl-dev \
+            libjack-dev \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxcb-dri2-0-dev \
+            libxcb-icccm4-dev \
+            libxcursor-dev \
+            libxkbcommon-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # The universal macOS bundle is built from x86_64 and AArch64 artifacts.
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+        if: runner.os == 'macOS'
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        if: runner.os != 'macOS'
+
+      - name: Package all targets from bundler.toml
+        run: |
+          if [[ ${{ matrix.name }} = "macOS-universal" ]]; then
+            export MACOSX_DEPLOYMENT_TARGET=10.13
+            cargo xtask bundle-universal polarity_sc_dark --release
+          else
+            cargo xtask bundle polarity_sc_dark --release
+          fi
+
+      - name: Stage the zip contents
+        env:
+          PLATFORM: ${{ matrix.name }}
+        run: |
+          mkdir -p "Spectral-Compressor-${PLATFORM}-vst3+clap"
+          mv target/bundled/* "Spectral-Compressor-${PLATFORM}-vst3+clap/"
+          cp ".github/workflows/readme-${{ runner.os }}.txt" \
+            "Spectral-Compressor-${PLATFORM}-vst3+clap/README.txt"
+          # Restore the exec bits so the binaries launch after unzipping.
+          find "Spectral-Compressor-${PLATFORM}-vst3+clap" -path '*/Contents/MacOS/*' -type f -exec chmod +x {} +
+          find "Spectral-Compressor-${PLATFORM}-vst3+clap" -path '*/Contents/x86_64-win/*' -type f -exec chmod +x {} +
+          ls -lR "Spectral-Compressor-${PLATFORM}-vst3+clap"
+
+      - name: Zip the bundles
+        env:
+          PLATFORM: ${{ matrix.name }}
+        run: |
+          # `zip` is missing on the Windows runners' bash; 7-Zip is preinstalled.
+          if command -v zip >/dev/null 2>&1; then
+            zip -qr "Spectral-Compressor-${PLATFORM}-vst3+clap.zip" "Spectral-Compressor-${PLATFORM}-vst3+clap"
+          else
+            7z a -tzip "Spectral-Compressor-${PLATFORM}-vst3+clap.zip" "Spectral-Compressor-${PLATFORM}-vst3+clap"
+          fi
+          ls -l "Spectral-Compressor-${PLATFORM}-vst3+clap.zip"
+
+      - name: Upload the zip as an artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Spectral-Compressor-${{ matrix.name }}-vst3+clap
+          path: Spectral-Compressor-${{ matrix.name }}-vst3+clap.zip
+
+  create-release:
+    needs: package
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          # Full history + tags so the commit log relative to the previous
+          # `v*` tag can be generated.
+          fetch-depth: 0
+
+      - name: Download the platform zips
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Build the release notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Unsigned build. See README.md: trust the macOS builds with System Settings > Privacy & Security > Open Anyway, or \`xattr -dr com.apple.quarantine <path>\`."
+            # The newest `v*` tag whose numeric core (mirroring
+            # update_check::parse_version_tag: strip the `v`, cut at the first
+            # non-digit/non-dot) is strictly below this tag's. Suffix tags like
+            # `v0.6.0-rc1` rank equal to their numeric core on both sides, so
+            # they never interleave above the version they belong to and can
+            # never be picked as a previous release of a newer tag.
+            t=${TAG#v}
+            t=${t%%[^0-9.]*}
+            IFS=. read -r cm cn cp <<< "$t"
+            previous_tag=""
+            while read -r tm tn tp tag; do
+              if ((tm < cm)) || ((tm == cm && tn < cn)) || ((tm == cm && tn == cn && tp < cp)); then
+                previous_tag=$tag
+              fi
+            done < <(git tag --list 'v*' --merge "$TAG" |
+              while IFS= read -r tag; do
+                t=${tag#v}
+                t=${t%%[^0-9.]*}
+                IFS=. read -r a b c <<< "$t"
+                printf '%s\n' "${a:-0} ${b:-0} ${c:-0} $tag"
+              done | sort -k1,1n -k2,2n -k3,3n)
+            if [[ -n $previous_tag ]]; then
+              echo ""
+              echo "## Changes since $previous_tag"
+              echo ""
+              git log --oneline "$previous_tag..$TAG" | sed 's/^/- /'
+            fi
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: Attach the zips to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Resname Spectral Compressor ${{ github.ref_name }}
+          body_path: release-notes.md
+          files: dist/*.zip
