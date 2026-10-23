@@ -50,17 +50,22 @@ VST3 + CLAP for all three desktop platforms.
   built before the fetch returns, so the result must reach an already-mounted
   view. If no such polling/lens mechanism fires after mount, poll the shared
   slot with a vizia timer (~1 s cadence, stopped once the banner resolves).
-- **UI, once available:** a dismissable strip directly under the header bar,
-  full width, styled to the existing theme: thin gold outline (`#e6b23a`),
-  small gold dot, left text "v<version> is available", right-aligned
-  "Open ↗" button and a ✕ dismiss control. The strip is inserted as a child
-  of `main_column` between `header_bar` and `globals_bar`; the existing
-  layout (`globals-bar` etc.) must reflow cleanly — on Linux/X11 verify in
-  the standalone that the strip's insertion does not clip the column content.
+- **UI, once available:** a dismissable strip, styled to the existing theme:
+  thin gold outline (`#e6b23a`), small gold dot, left text "v<version> is
+  available", right-aligned "Open ↗" button and a ✕ dismiss control. It
+  **overlays** the header bar's area (positioned by the editor layout) and does
+  **not** reflow the rest of the column: the GUI is a fixed 1360×690
+  (`ViziaState::new(move || (GUI_WIDTH, GUI_HEIGHT))`), nothing else may be
+  squeezed, and `GUI_HEIGHT` must not change. The other header controls stay
+  usable; design the overlay so it does not block them while dismissable
+  (e.g. covering the title/match-status area, not the Panic/Bypass buttons).
 - **Dismissal:** ✕ removes the strip for this GUI session only. It reappears
   on the next editor open as long as the (re)fetch still says "newer".
 - **Version display honesty:** the strip text shows the *release* version
   found on GitHub, not a hardcoded one.
+- **Which repo:** both the endpoint and the button always target
+  `resname/plugin.nih.polarity-sc-AUv3` (origin). Releases are published only
+  there; no repository-derived configurability.
 
 ## Release workflow (CI)
 
@@ -80,8 +85,9 @@ VST3 + CLAP for all three desktop platforms.
   `Spectral-Compressor-Linux-vst3+clap.zip`.
 - **Release creation:** one job (after the matrix) uploads all zips to a
   GitHub release for the tag, e.g. via `softprops/action-gh-release`.
-  Release body: short summary + release-notes text from the changelog/commit
-  range is fine — keep it simple, no external changelog system.
+  Release body: a static "unsigned build" note plus the commit log of
+  `<previous-tag>..<tag>` (`git log --oneline`, plain markdown list); no
+  changelog file.
 - **Non-goals for CI:** no notarization/signing, no AUv3 in the assets, no
   auto-update installer, no beta/prerelease channel (a `v*` tag is a
   release).
