@@ -83,6 +83,45 @@
   height: auto;
 }
 
+/* The bar on top of the threshold columns holding the shared parameters. */
+
+.globals-bar {
+  width: 1s;
+  height: auto;
+  col-between: 10px;
+  left: 10px;
+  right: 10px;
+  top: 4px;
+  bottom: 4px;
+}
+
+.globals-bar-group {
+  size: auto;
+  col-between: 4px;
+}
+
+.bar-slider {
+  width: 90px;
+}
+
+.page-stack {
+  size: auto;
+  left: 10px;
+  right: 10px;
+  top: 4px;
+}
+
+/* Section headings inside the per-path columns. */
+
+.section-label {
+  color: #8e8e95;
+  font-family: "Noto Sans";
+  font-weight: thin;
+  font-size: 15;
+  left: 1px;
+  top: 4px;
+}
+
 .column-title {
   font-family: "Noto Sans";
   font-weight: thin;

@@ -51,7 +51,7 @@ if (APPLE)
             # constant is the only source hosts capturing preferredContentSize
             # once at view capture can use. Update when the plugin GUI size
             # changes.
-            PREFERRED_GUI_SIZE "1360x570"
+            PREFERRED_GUI_SIZE "1360x690"
             MACOS_EMBEDDED_CLAP_LOCATION "${POLARITY_CLAP_LOCATION}"
     )
     add_executable(polarity_sc_dark_as_auv3_standalone)

@@ -35,7 +35,8 @@ use self::export_ir_button::ExportIrButton;
 use self::match_button::MatchButton;
 use self::match_curve_button::{ClearCurveButton, MatchCurveButton};
 use crate::analyzer::AnalyzerData;
-use crate::compressor_bank::ThresholdMode;
+// The compressor bank's `Path` enum, aliased to avoid the std `Path` import above.
+use crate::compressor_bank::{Path as CompressionPath, ThresholdMode};
 use crate::curve_preset::{
     delete_user_preset, load_curve_presets, save_user_preset_to_path, user_preset_dir, CurvePreset,
     CurvePresetEntry, CurvePresetSource,
@@ -55,10 +56,9 @@ pub mod theme;
 /// The entire GUI's width, in logical pixels.
 const GUI_WIDTH: u32 = 1360;
 /// The entire GUI's height, in logical pixels.
-// 530 + 40: one extra GenericUi row (~30px + spacing) was added for the
-// 'Upwards Max Boost' parameter. Keep this in sync with the
-// PREFERRED_GUI_SIZE "1360x570" in auv3/CMakeLists.txt.
-const GUI_HEIGHT: u32 = 570;
+// ~690px of content: the globals bar plus the full per-path threshold and compressor columns.
+// Keep this in sync with the Preferred GUI size in auv3/CMakeLists.txt.
+const GUI_HEIGHT: u32 = 690;
 
 // All GUI colors are defined in `editor::theme`.
 
@@ -651,10 +651,77 @@ pub(crate) fn create(editor_state: Arc<ViziaState>, editor_data: Data) -> Option
 fn main_column(cx: &mut Context) {
     VStack::new(cx, |cx| {
         header_bar(cx);
-        global_and_threshold_row(cx);
-        compressor_columns(cx);
+        globals_bar(cx);
+        threshold_row(cx);
     })
     .class("main-column");
+}
+
+/// The bar on top of the threshold columns holding the controls shared between both compression
+/// paths: output gain, mix, the FFT window, and the freeze/export controls.
+fn globals_bar(cx: &mut Context) {
+    let global_params = Data::params.map(|p| p.global.clone());
+
+    HStack::new(cx, |cx| {
+        HStack::new(cx, |cx| {
+            Label::new(cx, "Output Gain").class("label");
+            ParamSlider::new(cx, global_params, |params| &params.output_gain).class("bar-slider");
+        })
+        .class("globals-bar-group");
+
+        HStack::new(cx, |cx| {
+            Label::new(cx, "Mix").class("label");
+            ParamSlider::new(cx, global_params, |params| &params.dry_wet_ratio)
+                .class("bar-slider");
+        })
+        .class("globals-bar-group");
+
+        HStack::new(cx, |cx| {
+            Label::new(cx, "FFT Window").class("label");
+            HStack::new(cx, |cx| {
+                ParamSlider::new(cx, global_params, |params| &params.window_size_order)
+                    .set_style(ParamSliderStyle::FromLeft)
+                    .class("bar-slider")
+                    .tooltip(|cx| {
+                        Label::new(
+                            cx,
+                            "Window size controls the FFT analysis length. \nLarger windows improve frequency resolution but respond more slowly.",
+                        );
+                    });
+                ParamSlider::new(cx, global_params, |params| &params.overlap_times_order)
+                    .set_style(ParamSliderStyle::FromLeft)
+                    .class("bar-slider")
+                    .tooltip(|cx| {
+                        Label::new(
+                            cx,
+                            "Window overlap controls how often overlapping analysis windows are processed. \nMore overlap is smoother but uses more CPU.",
+                        );
+                    });
+            })
+            .class("globals-bar-group");
+        })
+        .class("globals-bar-group");
+
+        HStack::new(cx, |cx| {
+            ParamButton::new(cx, global_params, |params| &params.compressor_freeze)
+                .with_label("Freeze")
+                .class("freeze-button");
+            ExportIrButton::new(cx, Data::frozen_ir_data, "Export IR...")
+                .disabled(ExportUiModel::can_export.map(|can_export| !*can_export))
+                .class("freeze-button");
+        })
+        .class("globals-bar-group");
+    })
+    .class("globals-bar");
+}
+
+/// The row with both compression paths' full threshold and compressor columns.
+fn threshold_row(cx: &mut Context) {
+    HStack::new(cx, |cx| {
+        path_column(cx, CompressionPath::Downwards);
+        path_column(cx, CompressionPath::Upwards);
+    })
+    .class("page-stack");
 }
 
 /// Header row containing Delta/Match/Bypass controls, status, and title/version.
@@ -709,216 +776,154 @@ fn header_bar(cx: &mut Context) {
     .class("header-bar");
 }
 
-/// First content row with global controls and threshold controls.
-fn global_and_threshold_row(cx: &mut Context) {
-    HStack::new(cx, |cx| {
-        make_column(cx, "Globals", None, |cx| {
-            global_column(cx);
-        });
-
-        make_column(cx, "Threshold", None, |cx| {
-            threshold_column(cx);
-        });
-    })
-    .size(Auto);
-}
-
-/// Renders the global parameter section with custom row ordering/grouping.
-fn global_column(cx: &mut Context) {
-    let global_params = Data::params.map(|p| p.global.clone());
-
-    GenericUi::new_custom(cx, global_params, |cx, param_ptr| {
-        let name = unsafe { param_ptr.name() };
-        if name == "Window Size" {
-            HStack::new(cx, |cx| {
-                Label::new(cx, "FFT Window").class("label");
-                HStack::new(cx, |cx| {
-                    ParamSlider::new(cx, global_params, |params| &params.window_size_order)
-                        .set_style(ParamSliderStyle::FromLeft)
-                        .class("fft-window-slider")
-                        .tooltip(|cx| {
-                            Label::new(
-                                cx,
-                                "Window size controls the FFT analysis length. \nLarger windows improve frequency resolution but respond more slowly.",
-                            );
-                        });
-                    ParamSlider::new(cx, global_params, |params| &params.overlap_times_order)
-                        .set_style(ParamSliderStyle::FromLeft)
-                        .class("fft-window-slider")
-                        .tooltip(|cx| {
-                            Label::new(
-                                cx,
-                                "Window overlap controls how often overlapping analysis windows are processed. \nMore overlap is smoother but uses more CPU.",
-                            );
-                        });
-                })
-                .class("fft-window-group");
-            })
-            .class("row");
-        } else if name == "Window Overlap" {
-            // Rendered together with Window Size above.
-        } else if name == "Output Gain" || name == "Mix" {
-            HStack::new(cx, |cx| {
-                Label::new(cx, name).class("label");
-                GenericUi::draw_widget(cx, global_params, param_ptr);
-            })
-            .class("row");
-        } else if name == "Freeze" {
-            HStack::new(cx, |cx| {
-                Label::new(cx, name).class("label");
-                HStack::new(cx, |cx| {
-                    ParamButton::new(cx, global_params, |params| &params.compressor_freeze)
-                        .with_label("Freeze")
-                        .class("freeze-button");
-                    ExportIrButton::new(cx, Data::frozen_ir_data, "Export IR...")
-                        .disabled(ExportUiModel::can_export.map(|can_export| !*can_export))
-                        .class("freeze-button");
-                })
-                .class("freeze-button-group");
-            })
-            .class("row");
-        }
-    });
-}
-
-/// Renders threshold parameters. Transitional until Task 7 switches the editor to the tabbed
-/// per-path layout: this shows the downwards path's parameters only.
-fn threshold_column(cx: &mut Context) {
-    let threshold_params = Data::params.map(|p| p.thresholds.downwards.clone());
+/// Builds one full column for a single compression path: its envelope timings, its own threshold
+/// parameters (including the curve matching controls), and its compressor parameters.
+fn path_column(cx: &mut Context, path: CompressionPath) {
+    let (name_prefix, css_class) = match path {
+        CompressionPath::Downwards => ("Downwards", "downwards-col"),
+        CompressionPath::Upwards => ("Upwards", "upwards-col"),
+    };
+    let path_params = match path {
+        CompressionPath::Downwards => Data::params.map(|p| p.thresholds.downwards.clone()),
+        CompressionPath::Upwards => Data::params.map(|p| p.thresholds.upwards.clone()),
+    };
+    let compressor_params = match path {
+        CompressionPath::Downwards => Data::params.map(|p| p.compressors.downwards.clone()),
+        CompressionPath::Upwards => Data::params.map(|p| p.compressors.upwards.clone()),
+    };
     let global_params = Data::params.map(|p| p.global.clone());
     let mut curve_controls_drawn = false;
 
-    GenericUi::new_custom(cx, threshold_params, |cx, param_ptr| {
-        let name = unsafe { param_ptr.name() };
+    make_column(cx, name_prefix, Some(css_class), |cx| {
+        GenericUi::new_custom(cx, path_params, move |cx, param_ptr| {
+            let name = unsafe { param_ptr.name() };
 
-        if name == "Downwards Threshold Center" {
-            HStack::new(cx, |cx| {
-                Label::new(cx, "Threshold").class("label");
+            if name == format!("{name_prefix} Threshold Center") {
                 HStack::new(cx, |cx| {
-                    ParamSlider::new(cx, threshold_params, |params| {
-                        &params.threshold.center_frequency
+                    Label::new(cx, "Threshold").class("label");
+                    HStack::new(cx, |cx| {
+                        ParamSlider::new(cx, path_params, |params| {
+                            &params.threshold.center_frequency
+                        })
+                        .class("threshold-slider")
+                        .tooltip(|cx| {
+                            Label::new(
+                                cx,
+                                "Threshold center is the frequency where the global threshold value is anchored.",
+                            );
+                        });
+                        ParamSlider::new(cx, path_params, |params| {
+                            &params.threshold.curve_slope
+                        })
+                        .class("threshold-slider")
+                        .tooltip(|cx| {
+                            Label::new(
+                                cx,
+                                "Threshold slope tilts the threshold curve across octaves. In Pink Noise mode, 3 dB/oct is the neutral default.",
+                            );
+                        });
                     })
-                    .class("threshold-slider")
-                    .tooltip(|cx| {
-                        Label::new(
-                            cx,
-                            "Threshold center is the frequency where the global threshold value is anchored.",
-                        );
-                    });
-                    ParamSlider::new(cx, threshold_params, |params| {
-                        &params.threshold.curve_slope
-                    })
-                    .class("threshold-slider")
-                    .tooltip(|cx| {
-                        Label::new(
-                            cx,
-                            "Threshold slope tilts the threshold curve across octaves. In Pink Noise mode, 3 dB/oct is the neutral default.",
-                        );
-                    });
+                    .class("threshold-slider-group");
                 })
-                .class("threshold-slider-group");
-            })
-            .class("row");
-        } else if name == "Downwards Threshold Slope" {
-            // Rendered together with Threshold Center above.
-        } else {
-            HStack::new(cx, |cx| {
-                Label::new(cx, name).class("label");
-
-                if name == "Downwards Mode" {
-                    mode_picklist(cx);
-                } else {
-                    GenericUi::draw_widget(cx, threshold_params, param_ptr);
-                }
-            })
-            .class("row");
-        }
-
-        if !curve_controls_drawn && name == "Downwards Threshold Slope" {
-            curve_controls_drawn = true;
-            HStack::new(cx, |cx| {
-                Label::new(cx, "Curve Matching").class("label");
+                .class("row");
+            } else if name == format!("{name_prefix} Threshold Slope") {
+                // Rendered together with Threshold Center above.
+            } else if name == format!("{name_prefix} Mode") {
                 HStack::new(cx, |cx| {
-                    MatchCurveButton::new(
+                    Label::new(cx, "Mode").class("label");
+                    mode_picklist(cx, path);
+                })
+                .class("row");
+            } else if name == format!("{name_prefix} Global Threshold") {
+                // The threshold section heading is drawn before its first row
+                Label::new(cx, "THRESHOLD").class("section-label");
+
+                HStack::new(cx, |cx| {
+                    Label::new(cx, "Global Threshold").class("label");
+                    GenericUi::draw_widget(cx, path_params, param_ptr);
+                })
+                .class("row");
+            } else {
+                HStack::new(cx, |cx| {
+                    Label::new(
                         cx,
-                        Data::match_curve_runtime,
-                        Data::delta_active,
-                        global_params,
-                        "Match",
+                        name.strip_prefix(&format!("{name_prefix} "))
+                            .expect("missing prefix"),
                     )
-                    .class("threshold-curve-button");
-                    ClearCurveButton::new(cx, "Clear").class("threshold-curve-button");
-                })
-                .class("curve-matching-button-group");
-            })
-            .class("row");
+                    .class("label");
 
-            HStack::new(cx, |cx| {
-                Label::new(cx, "Curve Presets").class("label");
+                    GenericUi::draw_widget(cx, path_params, param_ptr);
+                })
+                .class("row");
+            }
+
+            if !curve_controls_drawn && name == format!("{name_prefix} Threshold Slope") {
+                curve_controls_drawn = true;
                 HStack::new(cx, |cx| {
-                    curve_preset_picklist(cx);
-                    CurvePresetButton::new(cx, CurvePresetButtonAction::SaveRequested, "Save")
-                        .class("curve-preset-button");
-                    CurvePresetButton::new(cx, CurvePresetButtonAction::DeleteSelected, "Del")
-                        .disabled(
-                            ExportUiModel::can_delete_curve_preset.map(|can_delete| !*can_delete),
+                    Label::new(cx, "Curve Matching").class("label");
+                    HStack::new(cx, |cx| {
+                        MatchCurveButton::new(
+                            cx,
+                            Data::match_curve_runtime,
+                            Data::delta_active,
+                            global_params,
+                            "Match",
                         )
-                        .class("curve-preset-button");
+                        .class("threshold-curve-button");
+                        ClearCurveButton::new(cx, "Clear").class("threshold-curve-button");
+                    })
+                    .class("curve-matching-button-group");
                 })
-                .class("curve-preset-control-group");
-            })
-            .class("row");
-        }
-    });
-}
+                .class("row");
 
-/// Builds side-by-side upwards and downwards compressor columns.
-fn compressor_columns(cx: &mut Context) {
-    HStack::new(cx, |cx| {
-        upwards_column(cx);
-        downwards_column(cx);
-    })
-    .size(Auto);
-}
-
-/// Renders controls for the upwards compressor bank.
-fn upwards_column(cx: &mut Context) {
-    make_column(cx, "Upwards", Some("upwards-col"), |cx| {
-        let upwards_compressor_params = Data::params.map(|p| p.compressors.upwards.clone());
-        GenericUi::new_custom(cx, upwards_compressor_params, |cx, param_ptr| {
-            HStack::new(cx, |cx| {
-                Label::new(
-                    cx,
-                    unsafe { param_ptr.name() }
-                        .strip_prefix("Upwards ")
-                        .expect("missing prefix"),
-                )
-                .class("label");
-
-                GenericUi::draw_widget(cx, upwards_compressor_params, param_ptr);
-            })
-            .class("row");
+                HStack::new(cx, |cx| {
+                    Label::new(cx, "Curve Presets").class("label");
+                    HStack::new(cx, |cx| {
+                        curve_preset_picklist(cx);
+                        CurvePresetButton::new(cx, CurvePresetButtonAction::SaveRequested, "Save")
+                            .class("curve-preset-button");
+                        CurvePresetButton::new(cx, CurvePresetButtonAction::DeleteSelected, "Del")
+                            .disabled(
+                                ExportUiModel::can_delete_curve_preset
+                                    .map(|can_delete| !*can_delete),
+                            )
+                            .class("curve-preset-button");
+                    })
+                    .class("curve-preset-control-group");
+                })
+                .class("row");
+            }
         });
-    });
-}
 
-/// Renders controls for the downwards compressor bank.
-fn downwards_column(cx: &mut Context) {
-    make_column(cx, "Downwards", Some("downwards-col"), |cx| {
-        let downwards_compressor_params = Data::params.map(|p| p.compressors.downwards.clone());
-        GenericUi::new_custom(cx, downwards_compressor_params, |cx, param_ptr| {
-            HStack::new(cx, |cx| {
-                Label::new(
-                    cx,
-                    unsafe { param_ptr.name() }
-                        .strip_prefix("Downwards ")
-                        .expect("missing prefix"),
-                )
-                .class("label");
+        GenericUi::new_custom(cx, compressor_params, move |cx, param_ptr| {
+            let name = unsafe { param_ptr.name() };
 
-                GenericUi::draw_widget(cx, downwards_compressor_params, param_ptr);
-            })
-            .class("row");
+            // The compressor section heading is drawn before its first row
+            if name == format!("{name_prefix} Offset") {
+                Label::new(cx, "COMPRESSOR").class("section-label");
+            }
+
+            if name == format!("{name_prefix} Max Boost") {
+                // The downwards path never adds gain, so its dead cap stays visible but inert
+                HStack::new(cx, |cx| {
+                    Label::new(cx, "Max Boost").class("label");
+                    GenericUi::draw_widget(cx, compressor_params, param_ptr);
+                })
+                .class("row")
+                .disabled(true);
+            } else {
+                HStack::new(cx, |cx| {
+                    Label::new(
+                        cx,
+                        name.strip_prefix(&format!("{name_prefix} "))
+                            .expect("missing prefix"),
+                    )
+                    .class("label");
+
+                    GenericUi::draw_widget(cx, compressor_params, param_ptr);
+                })
+                .class("row");
+            }
         });
     });
 }
@@ -927,10 +932,20 @@ fn downwards_column(cx: &mut Context) {
 fn analyzer_column(cx: &mut Context) {
     HStack::new(cx, |cx| {
         // The analyzer shows and edits the curve points of the selected path
-        ThresholdCurveSelectButton::new(cx, Data::selected_threshold_curve, 0, "Down")
-            .class("threshold-curve-button");
-        ThresholdCurveSelectButton::new(cx, Data::selected_threshold_curve, 1, "Up")
-            .class("threshold-curve-button");
+        SelectStateButton::new(
+            cx,
+            Data::selected_threshold_curve,
+            0,
+            "Down",
+            "threshold-curve-button",
+        );
+        SelectStateButton::new(
+            cx,
+            Data::selected_threshold_curve,
+            1,
+            "Up",
+            "threshold-curve-button",
+        );
     })
     .class("curve-matching-button-group");
     Analyzer::new(
@@ -942,41 +957,41 @@ fn analyzer_column(cx: &mut Context) {
     );
 }
 
-/// A button that stores which compression path's threshold curve the analyzer edits.
-struct ThresholdCurveSelectButton {
-    selected_threshold_curve: Arc<AtomicU8>,
-    curve_index: u8,
+/// A button that stores a value into one of the editor's `AtomicU8` selection states, e.g. which
+/// path's threshold curve the analyzer edits, or which tab page is open.
+struct SelectStateButton {
+    selected_state: Arc<AtomicU8>,
+    value: u8,
 }
 
-impl ThresholdCurveSelectButton {
-    pub fn new<LSelected, T>(
-        cx: &mut Context,
-        selected_threshold_curve: LSelected,
-        curve_index: u8,
+impl SelectStateButton {
+    pub fn new<'a, LSelected, T>(
+        cx: &'a mut Context,
+        selected_state: LSelected,
+        value: u8,
         label: impl Res<T> + Clone,
-    ) -> Handle<'_, Self>
+        css_class: &'static str,
+    ) -> Handle<'a, Self>
     where
         LSelected: Lens<Target = Arc<AtomicU8>>,
         T: ToString,
     {
         let handle = Self {
-            selected_threshold_curve: selected_threshold_curve.get(cx),
-            curve_index,
+            selected_state: selected_state.get(cx),
+            value,
         }
         .build(cx, |cx| {
             Label::new(cx, label).hoverable(false);
         })
-        .class("editor-mode");
+        .class(css_class);
 
-        // Grey the button out while its path is already selected
-        handle.disabled(
-            selected_threshold_curve
-                .map(move |selected| selected.load(Ordering::Relaxed) == curve_index),
-        )
+        // Grey the button out while its value is already selected
+        handle
+            .disabled(selected_state.map(move |selected| selected.load(Ordering::Relaxed) == value))
     }
 }
 
-impl View for ThresholdCurveSelectButton {
+impl View for SelectStateButton {
     fn element(&self) -> Option<&'static str> {
         Some("param-button")
     }
@@ -990,8 +1005,7 @@ impl View for ThresholdCurveSelectButton {
                 if cx.is_disabled() {
                     return;
                 }
-                self.selected_threshold_curve
-                    .store(self.curve_index, Ordering::Relaxed);
+                self.selected_state.store(self.value, Ordering::Relaxed);
             }
             _ => {}
         });
@@ -1044,38 +1058,38 @@ fn prompt_for_curve_preset_path(dir: &Path) -> Option<PathBuf> {
         .save_file()
 }
 
-/// Custom threshold mode selector that writes raw parameter automation events.
-fn mode_picklist(cx: &mut Context) {
+/// Custom threshold mode selector that writes raw parameter automation events. There is one
+/// picklist per compression path, each writing that path's own mode parameter.
+fn mode_picklist(cx: &mut Context, path: CompressionPath) {
     let params = Data::params.get(cx);
+    let mode_index = move |p: &SpectralCompressorParams| match path {
+        CompressionPath::Downwards => p.thresholds.downwards.threshold.mode.value().to_index(),
+        CompressionPath::Upwards => p.thresholds.upwards.threshold.mode.value().to_index(),
+    };
 
     PickList::new(
         cx,
         Data::mode_options,
-        Data::params.map(|p| p.thresholds.downwards.threshold.mode.value().to_index()),
+        Data::params.map(move |p| mode_index(p)),
         true,
     )
     .class("mode-picklist")
     .on_select(move |cx, index| {
-        if params
-            .thresholds
-            .downwards
-            .threshold
-            .mode
-            .value()
-            .to_index()
-            == index
-        {
+        if mode_index(&params) == index {
             return;
         }
 
         let new_mode = ThresholdMode::from_index(index);
-        let mode_param = params.thresholds.downwards.threshold.mode.as_ptr();
-        let normalized = params
-            .thresholds
-            .downwards
-            .threshold
-            .mode
-            .preview_normalized(new_mode);
+        let (normalized, mode_param) = match path {
+            CompressionPath::Downwards => {
+                let mode = &params.thresholds.downwards.threshold.mode;
+                (mode.preview_normalized(new_mode), mode.as_ptr())
+            }
+            CompressionPath::Upwards => {
+                let mode = &params.thresholds.upwards.threshold.mode;
+                (mode.preview_normalized(new_mode), mode.as_ptr())
+            }
+        };
 
         cx.emit(RawParamEvent::BeginSetParameter(mode_param));
         cx.emit(RawParamEvent::SetParameterNormalized(
