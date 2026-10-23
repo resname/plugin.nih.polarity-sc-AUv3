@@ -61,10 +61,12 @@ jobs:
             [ -n "$f" ] && [ -e "$f" ] || { echo "missing build product: '$f'" >&2; ls -R build >&2; exit 1; }
           done
           # The CLAP is only an intermediate build input for the wrapper targets; it is
-          # not shipped in releases (releases are the .app and the .appex). Lipo-verify
-          # its Mach-O anyway as a build sanity check.
+          # not shipped in releases (releases are the .app). Lipo-verify its Mach-O
+          # anyway as a build sanity check.
           lipo -info target/bundled/Resname-Spectral-Compressor.clap/Contents/MacOS/Resname-Spectral-Compressor
-          ditto "$appex" stage/Resname-Spectral-Compressor.appex
+          # The .appex is not shipped separately: AUv3 extensions must stay
+          # bundled inside the container .app (Contents/PlugIns/) — hosts
+          # register them via pluginkit when the app is launched.
           ditto "$app" "stage/Resname Spectral Compressor AUv3.app"
       - uses: actions/upload-artifact@v4
         with:
@@ -73,10 +75,11 @@ jobs:
 
   publish-release:
     # Tag-triggered: attach the AUv3 standalone app (as a drag-to-Applications
-    # installer .dmg) and the appex (as a .zip) as two separate assets to the
-    # GitHub Release the build.yml publish-release job creates (creation is
-    # idempotent there). hdiutil only exists on macOS, so this runs on a
-    # macos runner.
+    # installer .dmg) as an asset to the GitHub Release the build.yml
+    # publish-release job creates (creation is idempotent there).
+    # The .appex is not published separately — it ships inside the .app,
+    # which hosts discover via pluginkit on first launch.
+    # hdiutil only exists on macOS, so this runs on a macos runner.
     name: Attach AUv3 to release
     if: startsWith(github.ref, 'refs/tags/')
     needs: auv3-macos
@@ -105,16 +108,19 @@ jobs:
           # binary (NSPOSIXErrorDomain 111). Restore the exec bit on every
           # Mach-O under Contents/MacOS before packaging.
           find . -path '*/Contents/MacOS/*' -type f -exec chmod +x {} +
-          APPEX_ZIP="Resname-Spectral-Compressor-${TAG}-appex.zip"
+          # The appex ships bundled inside the app (Contents/PlugIns/);
+          # verify it survived packaging instead of shipping it separately.
+          test -d "Resname Spectral Compressor AUv3.app/Contents/PlugIns/Resname-Spectral-Compressor.appex" || {
+            echo "app is missing the bundled appex" >&2; exit 1
+          }
           APP_DMG="Resname-Spectral-Compressor-${TAG}-standalone.dmg"
-          zip -qr "$APPEX_ZIP" "Resname-Spectral-Compressor.appex"
           # Classic drag-to-install layout: the app plus a symlink to the
           # Applications folder so the user can drag it into place.
           mkdir -p dmgroot
           cp -R "Resname Spectral Compressor AUv3.app" dmgroot/
           ln -s /Applications dmgroot/Applications
           hdiutil create -ov -volname "Resname Spectral Compressor" -srcfolder dmgroot -format UDZO "$APP_DMG"
-          ls -l "$APPEX_ZIP" "$APP_DMG"
+          ls -l "$APP_DMG"
 
       - name: Create or reuse the tag release
         env:
@@ -134,6 +140,5 @@ jobs:
         run: |
           gh release upload "$TAG" -R "$GITHUB_REPOSITORY" \
             "dist/Resname-Spectral-Compressor-${TAG}-standalone.dmg" \
-            "dist/Resname-Spectral-Compressor-${TAG}-appex.zip" \
             --clobber
           gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --latest
