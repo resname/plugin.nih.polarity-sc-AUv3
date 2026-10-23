@@ -80,6 +80,10 @@ pub(crate) struct PathState {
     /// Scratch buffer for this path's per-bin gain differences before they are combined with the
     /// other path's.
     pub(crate) raw_gain_difference_db: Vec<f32>,
+    /// This path's per-bin gain differences after spectral smoothing but before being combined.
+    pub(crate) smoothed_gain_difference_db: Vec<f32>,
+    /// Prefix sum over this path's raw gain differences, used by the gain smoother.
+    pub(crate) gain_smoothing_prefix_db: Vec<f32>,
 }
 
 impl PathState {
@@ -91,6 +95,8 @@ impl PathState {
             knee_parabola_intercept: Vec::new(),
             envelopes: Vec::new(),
             raw_gain_difference_db: Vec::new(),
+            smoothed_gain_difference_db: Vec::new(),
+            gain_smoothing_prefix_db: Vec::new(),
         }
     }
 
@@ -105,6 +111,12 @@ impl PathState {
             .reserve_exact(complex_buffer_len.saturating_sub(self.knee_parabola_intercept.len()));
         self.raw_gain_difference_db
             .reserve_exact(complex_buffer_len.saturating_sub(self.raw_gain_difference_db.len()));
+        self.smoothed_gain_difference_db.reserve_exact(
+            complex_buffer_len.saturating_sub(self.smoothed_gain_difference_db.len()),
+        );
+        self.gain_smoothing_prefix_db.reserve_exact(
+            (complex_buffer_len + 1).saturating_sub(self.gain_smoothing_prefix_db.len()),
+        );
     }
 
     fn resize_complex_len(&mut self, complex_buffer_len: usize) {
@@ -113,6 +125,10 @@ impl PathState {
         self.knee_parabola_scale.resize(complex_buffer_len, 1.0);
         self.knee_parabola_intercept.resize(complex_buffer_len, 1.0);
         self.raw_gain_difference_db.resize(complex_buffer_len, 0.0);
+        self.smoothed_gain_difference_db
+            .resize(complex_buffer_len, 0.0);
+        self.gain_smoothing_prefix_db
+            .resize(complex_buffer_len + 1, 0.0);
     }
 
     fn reserve_envelopes(&mut self, num_channels: usize, complex_buffer_len: usize) {
@@ -183,10 +199,8 @@ pub struct CompressorBank {
     linked_sidechain_magnitudes: Vec<f32>,
     /// The sum of both paths' per-bin gain differences before spectral smoothing.
     combined_raw_gain_difference_db: Vec<f32>,
-    /// Scratch buffer for the per-bin gain differences that will be applied.
-    smoothed_gain_difference_db: Vec<f32>,
-    /// Prefix sums for smoothing the gain curve without per-bin inner summing.
-    gain_smoothing_prefix_db: Vec<f32>,
+    /// The sum of both paths' smoothed per-bin gain differences that will be applied.
+    combined_smoothed_gain_difference_db: Vec<f32>,
     /// The frozen per-bin gain difference snapshot for each channel. When freeze is enabled these
     /// values are captured once and then reused until freeze is disabled or invalidated.
     frozen_gain_difference_db: Vec<Vec<f32>>,
@@ -797,8 +811,7 @@ impl CompressorBank {
             ],
             linked_sidechain_magnitudes: Vec::with_capacity(complex_buffer_len),
             combined_raw_gain_difference_db: Vec::with_capacity(complex_buffer_len),
-            smoothed_gain_difference_db: Vec::with_capacity(complex_buffer_len),
-            gain_smoothing_prefix_db: Vec::with_capacity(complex_buffer_len + 1),
+            combined_smoothed_gain_difference_db: Vec::with_capacity(complex_buffer_len),
             frozen_gain_difference_db: vec![Vec::with_capacity(complex_buffer_len); num_channels],
             frozen_gain_snapshot_valid: vec![false; num_channels],
             freeze_was_active: false,
@@ -843,11 +856,8 @@ impl CompressorBank {
         self.combined_raw_gain_difference_db.reserve_exact(
             complex_buffer_len.saturating_sub(self.combined_raw_gain_difference_db.len()),
         );
-        self.smoothed_gain_difference_db.reserve_exact(
-            complex_buffer_len.saturating_sub(self.smoothed_gain_difference_db.len()),
-        );
-        self.gain_smoothing_prefix_db.reserve_exact(
-            (complex_buffer_len + 1).saturating_sub(self.gain_smoothing_prefix_db.len()),
+        self.combined_smoothed_gain_difference_db.reserve_exact(
+            complex_buffer_len.saturating_sub(self.combined_smoothed_gain_difference_db.len()),
         );
         self.match_curve_meter.resize(complex_buffer_len);
 
@@ -887,10 +897,8 @@ impl CompressorBank {
             .resize(complex_buffer_len, 0.0);
         self.combined_raw_gain_difference_db
             .resize(complex_buffer_len, 0.0);
-        self.smoothed_gain_difference_db
+        self.combined_smoothed_gain_difference_db
             .resize(complex_buffer_len, 0.0);
-        self.gain_smoothing_prefix_db
-            .resize(complex_buffer_len + 1, 0.0);
         self.match_curve_meter.resize(complex_buffer_len);
 
         for gains in self.frozen_gain_difference_db.iter_mut() {
@@ -1077,8 +1085,9 @@ impl CompressorBank {
         }
         self.advance_envelope_timing_scale(channel_idx, overlap_times);
 
-        // Each path compresses its own envelope with its own transfer curve; the raw gain
-        // differences are then summed per bin and smoothed/combined
+        // Each path compresses its own envelope with its own transfer curve, smooths its own raw
+        // gain differences (without the DC clamp), and the smoothed curves are then combined
+        // (with the DC clamp) into the curve that gets applied
         self.compress_path(Path::Downwards, channel_idx, params, mode, first_non_dc_bin);
         self.compress_path(Path::Upwards, channel_idx, params, mode, first_non_dc_bin);
         for bin_idx in 0..num_bins {
@@ -1087,11 +1096,14 @@ impl CompressorBank {
                 + self.upwards.raw_gain_difference_db[bin_idx];
         }
 
-        self.smooth_gain_differences(
-            params.thresholds.downwards.threshold.gain_smoothing.value(),
-            first_non_dc_bin,
-            num_bins,
-        );
+        for (path, path_params) in [
+            (Path::Downwards, &params.thresholds.downwards),
+            (Path::Upwards, &params.thresholds.upwards),
+        ] {
+            let smoothing_amount = path_params.threshold.gain_smoothing.value();
+            self.smooth_path_gain_differences(path, smoothing_amount, num_bins);
+        }
+        self.combine_and_clamp_gain_differences(first_non_dc_bin, num_bins);
         self.apply_gain_differences(
             buffer,
             channel_idx,
@@ -1569,31 +1581,31 @@ impl CompressorBank {
         }
     }
 
-    fn smooth_gain_differences(
-        &mut self,
-        smoothing_amount: f32,
-        first_non_dc_bin: usize,
-        num_bins: usize,
-    ) {
-        assert!(self.combined_raw_gain_difference_db.len() >= num_bins);
-        assert!(self.smoothed_gain_difference_db.len() >= num_bins);
-        assert!(self.gain_smoothing_prefix_db.len() > num_bins);
+    fn smooth_path_gain_differences(&mut self, path: Path, smoothing_amount: f32, num_bins: usize) {
+        let path_state = match path {
+            Path::Downwards => &mut self.downwards,
+            Path::Upwards => &mut self.upwards,
+        };
+        assert!(path_state.raw_gain_difference_db.len() >= num_bins);
+        assert!(path_state.smoothed_gain_difference_db.len() >= num_bins);
+        assert!(path_state.gain_smoothing_prefix_db.len() > num_bins);
         assert!(self.ln_freqs.len() >= num_bins);
 
         let smoothing_amount = smoothing_amount.clamp(0.0, 1.0);
         if smoothing_amount <= f32::EPSILON || num_bins <= 2 {
-            self.smoothed_gain_difference_db[..num_bins]
-                .copy_from_slice(&self.combined_raw_gain_difference_db[..num_bins]);
+            path_state.smoothed_gain_difference_db[..num_bins]
+                .copy_from_slice(&path_state.raw_gain_difference_db[..num_bins]);
             return;
         }
 
-        self.gain_smoothing_prefix_db[0] = 0.0;
+        path_state.gain_smoothing_prefix_db[0] = 0.0;
         for bin_idx in 0..num_bins {
-            self.gain_smoothing_prefix_db[bin_idx + 1] = self.gain_smoothing_prefix_db[bin_idx]
-                + self.combined_raw_gain_difference_db[bin_idx];
+            path_state.gain_smoothing_prefix_db[bin_idx + 1] = path_state.gain_smoothing_prefix_db
+                [bin_idx]
+                + path_state.raw_gain_difference_db[bin_idx];
         }
 
-        self.smoothed_gain_difference_db[0] = self.combined_raw_gain_difference_db[0];
+        path_state.smoothed_gain_difference_db[0] = path_state.raw_gain_difference_db[0];
 
         let radius_ln = smoothing_amount * GAIN_SMOOTHING_MAX_RADIUS_LN;
         let mut left_idx = 1;
@@ -1611,18 +1623,34 @@ impl CompressorBank {
                 right_idx += 1;
             }
 
-            let sum = self.gain_smoothing_prefix_db[right_idx + 1]
-                - self.gain_smoothing_prefix_db[left_idx];
+            let sum = path_state.gain_smoothing_prefix_db[right_idx + 1]
+                - path_state.gain_smoothing_prefix_db[left_idx];
             let count = (right_idx - left_idx + 1) as f32;
             let averaged = sum / count;
-            let raw = self.combined_raw_gain_difference_db[bin_idx];
-            let mut smoothed = raw + ((averaged - raw) * smoothing_amount);
+            let raw = path_state.raw_gain_difference_db[bin_idx];
+            let smoothed = raw + ((averaged - raw) * smoothing_amount);
 
-            if bin_idx < first_non_dc_bin && smoothed > 0.0 {
-                smoothed = 0.0;
-            }
+            path_state.smoothed_gain_difference_db[bin_idx] = smoothed;
+        }
+    }
 
-            self.smoothed_gain_difference_db[bin_idx] = smoothed;
+    /// Sum the per-path smoothed gain differences into the combined smoothed curve that the
+    /// gain application consumes. Positive values below `first_non_dc_bin` are clamped to 0.0 so
+    /// a smoothed boost never turns into a low-frequency upwards gain.
+    fn combine_and_clamp_gain_differences(&mut self, first_non_dc_bin: usize, num_bins: usize) {
+        assert!(self.downwards.smoothed_gain_difference_db.len() >= num_bins);
+        assert!(self.upwards.smoothed_gain_difference_db.len() >= num_bins);
+        assert!(self.combined_smoothed_gain_difference_db.len() >= num_bins);
+
+        for bin_idx in 0..num_bins {
+            let combined = self.downwards.smoothed_gain_difference_db[bin_idx]
+                + self.upwards.smoothed_gain_difference_db[bin_idx];
+            self.combined_smoothed_gain_difference_db[bin_idx] =
+                if bin_idx < first_non_dc_bin && combined > 0.0 {
+                    0.0
+                } else {
+                    combined
+                };
         }
     }
 
@@ -1634,7 +1662,7 @@ impl CompressorBank {
         should_update_analyzer_data: bool,
     ) {
         assert!(self.frozen_gain_difference_db[channel_idx].len() == buffer.len());
-        assert!(self.smoothed_gain_difference_db.len() >= buffer.len());
+        assert!(self.combined_smoothed_gain_difference_db.len() >= buffer.len());
 
         let should_capture_snapshot =
             freeze_enabled && !self.frozen_gain_snapshot_valid[channel_idx];
@@ -1645,7 +1673,8 @@ impl CompressorBank {
             let analyzer_input_data = self.analyzer_input_data.input_buffer();
             assert!(analyzer_input_data.gain_difference_db.len() >= buffer.len());
             let frozen_gain_difference_db = &mut self.frozen_gain_difference_db[channel_idx];
-            let smoothed_gain_difference_db = &self.smoothed_gain_difference_db[..buffer.len()];
+            let smoothed_gain_difference_db =
+                &self.combined_smoothed_gain_difference_db[..buffer.len()];
 
             for (bin_idx, bin) in buffer.iter_mut().enumerate() {
                 let smoothed_gain_difference_db = smoothed_gain_difference_db[bin_idx];
@@ -2087,11 +2116,11 @@ mod tests {
                 [bin_idx]
                 + bank.upwards.raw_gain_difference_db[bin_idx];
         }
-        bank.smooth_gain_differences(
-            params.thresholds.downwards.threshold.gain_smoothing.value(),
-            first_non_dc_bin,
-            num_bins,
-        );
+        // Shared smoothing amount in the legacy configuration (both paths read the same value)
+        let smoothing_amount = params.thresholds.downwards.threshold.gain_smoothing.value();
+        bank.smooth_path_gain_differences(Path::Downwards, smoothing_amount, num_bins);
+        bank.smooth_path_gain_differences(Path::Upwards, smoothing_amount, num_bins);
+        bank.combine_and_clamp_gain_differences(first_non_dc_bin, num_bins);
         bank.apply_gain_differences(
             buffer,
             channel_idx,
@@ -2147,11 +2176,10 @@ mod tests {
                     bank.downwards.raw_gain_difference_db[bin_idx]
                         + bank.upwards.raw_gain_difference_db[bin_idx];
             }
-            bank.smooth_gain_differences(
-                params.thresholds.downwards.threshold.gain_smoothing.value(),
-                1,
-                num_bins,
-            );
+            let smoothing_amount = params.thresholds.downwards.threshold.gain_smoothing.value();
+            bank.smooth_path_gain_differences(Path::Downwards, smoothing_amount, num_bins);
+            bank.smooth_path_gain_differences(Path::Upwards, smoothing_amount, num_bins);
+            bank.combine_and_clamp_gain_differences(1, num_bins);
 
             // The legacy formula: one shared envelope, both curves applied to it, summed. The
             // per-path envelopes are equal so they double as the legacy envelope
@@ -2188,8 +2216,104 @@ mod tests {
                 })
                 .collect();
 
-            assert_slice_near(&bank.smoothed_gain_difference_db[..num_bins], &reference);
+            assert_slice_near(
+                &bank.combined_smoothed_gain_difference_db[..num_bins],
+                &reference,
+            );
         });
+    }
+
+    #[test]
+    fn smoothing_split_equals_legacy_when_paths_match_legacy() {
+        run_with_large_stack(|| {
+            let window_size = 64;
+            let num_bins = window_size / 2 + 1;
+            let first_non_dc_bin = 1;
+            let smoothing_amount = 0.8;
+            let (mut bank, _params, _ir) = make_bank_and_params(1, window_size);
+
+            // Arbitrary per-path raw curves: with both paths mirrored at the legacy
+            // configuration the split pipeline must equal the legacy single smoothing pass on
+            // the summed raw curve (smoothing is linear)
+            let down_raw: Vec<f32> = (0..num_bins)
+                .map(|bin_idx| ((bin_idx % 7) as f32 - 3.0) * 1.1)
+                .collect();
+            let up_raw: Vec<f32> = (0..num_bins)
+                .map(|bin_idx| ((bin_idx % 5) as f32 - 2.5) * 0.9 - 1.0)
+                .collect();
+            bank.downwards.raw_gain_difference_db[..num_bins].copy_from_slice(&down_raw);
+            bank.upwards.raw_gain_difference_db[..num_bins].copy_from_slice(&up_raw);
+
+            bank.smooth_path_gain_differences(Path::Downwards, smoothing_amount, num_bins);
+            bank.smooth_path_gain_differences(Path::Upwards, smoothing_amount, num_bins);
+            bank.combine_and_clamp_gain_differences(first_non_dc_bin, num_bins);
+
+            // Legacy reference: the windowed mean blend over the summed raw curve, plus the
+            // DC-bins clamp
+            let combined_raw: Vec<f32> = down_raw.iter().zip(&up_raw).map(|(d, u)| d + u).collect();
+            let radius_ln = smoothing_amount * GAIN_SMOOTHING_MAX_RADIUS_LN;
+            let mut prefix_db = vec![0.0; num_bins + 1];
+            for bin_idx in 0..num_bins {
+                prefix_db[bin_idx + 1] = prefix_db[bin_idx] + combined_raw[bin_idx];
+            }
+            let mut reference = vec![0.0; num_bins];
+            reference[0] = combined_raw[0];
+            for bin_idx in 1..num_bins {
+                let center_ln = bank.ln_freqs[bin_idx];
+                let mut left_idx = 1;
+                while left_idx < bin_idx && center_ln - bank.ln_freqs[left_idx] > radius_ln {
+                    left_idx += 1;
+                }
+                let mut right_idx = bin_idx;
+                while right_idx + 1 < num_bins
+                    && bank.ln_freqs[right_idx + 1] - center_ln <= radius_ln
+                {
+                    right_idx += 1;
+                }
+                let sum = prefix_db[right_idx + 1] - prefix_db[left_idx];
+                let count = (right_idx - left_idx + 1) as f32;
+                let averaged = sum / count;
+                let raw = combined_raw[bin_idx];
+                let mut smoothed = raw + ((averaged - raw) * smoothing_amount);
+                if bin_idx < first_non_dc_bin && smoothed > 0.0 {
+                    smoothed = 0.0;
+                }
+                reference[bin_idx] = smoothed;
+            }
+
+            assert_slice_near(
+                &bank.combined_smoothed_gain_difference_db[..num_bins],
+                &reference,
+            );
+        });
+    }
+
+    #[test]
+    fn dc_clamp_applies_to_combined_curve() {
+        let window_size = 16;
+        let num_bins = window_size / 2 + 1;
+        let (mut bank, _params, _ir) = make_bank_and_params(1, window_size);
+        bank.downwards.raw_gain_difference_db[..num_bins].fill(0.0);
+        bank.upwards.raw_gain_difference_db[..num_bins].fill(0.0);
+        // A smoothing amount of 0.0 copies the raws as-is, so the raw values directly control
+        // the per-path smoothed values
+        bank.downwards.raw_gain_difference_db[0] = 2.0;
+        bank.upwards.raw_gain_difference_db[0] = -5.0;
+        bank.downwards.raw_gain_difference_db[2] = 5.0;
+        bank.upwards.raw_gain_difference_db[2] = -3.0;
+        bank.downwards.raw_gain_difference_db[3] = 2.0;
+
+        bank.smooth_path_gain_differences(Path::Downwards, 0.0, num_bins);
+        bank.smooth_path_gain_differences(Path::Upwards, 0.0, num_bins);
+        bank.combine_and_clamp_gain_differences(3, num_bins);
+
+        // Combined values inside the DC range are clamped when they are positive: bin 2
+        // combines to +2.0 and is clamped to 0.0, while the net-reducing bin 0 (-3.0) and the
+        // net-neutral bin 1 (0.0) stay as they are. Bin 3, past the DC range, keeps its +2.0.
+        assert_eq!(bank.combined_smoothed_gain_difference_db[0], -3.0);
+        assert_eq!(bank.combined_smoothed_gain_difference_db[1], 0.0);
+        assert_eq!(bank.combined_smoothed_gain_difference_db[2], 0.0);
+        assert_eq!(bank.combined_smoothed_gain_difference_db[3], 2.0);
     }
 
     #[test]
@@ -2317,12 +2441,12 @@ mod tests {
         let raw: Vec<f32> = (0..num_bins)
             .map(|bin_idx| (bin_idx as f32 % 5.0) - 8.0)
             .collect();
-        compressor_bank.combined_raw_gain_difference_db[..num_bins].copy_from_slice(&raw);
+        compressor_bank.downwards.raw_gain_difference_db[..num_bins].copy_from_slice(&raw);
 
-        compressor_bank.smooth_gain_differences(0.0, 1, num_bins);
+        compressor_bank.smooth_path_gain_differences(Path::Downwards, 0.0, num_bins);
 
         assert_slice_near(
-            &compressor_bank.smoothed_gain_difference_db[..num_bins],
+            &compressor_bank.downwards.smoothed_gain_difference_db[..num_bins],
             &raw,
         );
     }
@@ -2333,15 +2457,15 @@ mod tests {
         let num_bins = window_size / 2 + 1;
         let (mut compressor_bank, _params, _frozen_ir_output_data) =
             make_bank_and_params(1, window_size);
-        compressor_bank.combined_raw_gain_difference_db[..num_bins].fill(0.0);
-        compressor_bank.combined_raw_gain_difference_db[16] = -24.0;
+        compressor_bank.downwards.raw_gain_difference_db[..num_bins].fill(0.0);
+        compressor_bank.downwards.raw_gain_difference_db[16] = -24.0;
 
-        compressor_bank.smooth_gain_differences(1.0, 1, num_bins);
+        compressor_bank.smooth_path_gain_differences(Path::Downwards, 1.0, num_bins);
 
-        assert!(compressor_bank.smoothed_gain_difference_db[16] > -24.0);
-        assert!(compressor_bank.smoothed_gain_difference_db[16] < 0.0);
-        assert!(compressor_bank.smoothed_gain_difference_db[15] < 0.0);
-        assert!(compressor_bank.smoothed_gain_difference_db[17] < 0.0);
+        assert!(compressor_bank.downwards.smoothed_gain_difference_db[16] > -24.0);
+        assert!(compressor_bank.downwards.smoothed_gain_difference_db[16] < 0.0);
+        assert!(compressor_bank.downwards.smoothed_gain_difference_db[15] < 0.0);
+        assert!(compressor_bank.downwards.smoothed_gain_difference_db[17] < 0.0);
     }
 
     #[test]
@@ -2350,11 +2474,11 @@ mod tests {
         let num_bins = window_size / 2 + 1;
         let (mut compressor_bank, _params, _frozen_ir_output_data) =
             make_bank_and_params(1, window_size);
-        compressor_bank.combined_raw_gain_difference_db[..num_bins].fill(-6.0);
+        compressor_bank.downwards.raw_gain_difference_db[..num_bins].fill(-6.0);
 
-        compressor_bank.smooth_gain_differences(1.0, 1, num_bins);
+        compressor_bank.smooth_path_gain_differences(Path::Downwards, 1.0, num_bins);
 
-        for gain_db in &compressor_bank.smoothed_gain_difference_db[..num_bins] {
+        for gain_db in &compressor_bank.downwards.smoothed_gain_difference_db[..num_bins] {
             assert!((*gain_db + 6.0).abs() < 1.0e-5);
         }
     }
@@ -2394,9 +2518,11 @@ mod tests {
         assert!(compressor_bank.combined_raw_gain_difference_db[..num_bins]
             .iter()
             .all(|raw| *raw == 0.0));
-        assert!(compressor_bank.smoothed_gain_difference_db[..num_bins]
-            .iter()
-            .all(|gain| gain.abs() < 1.0e-5));
+        assert!(
+            compressor_bank.combined_smoothed_gain_difference_db[..num_bins]
+                .iter()
+                .all(|gain| gain.abs() < 1.0e-5)
+        );
     }
 
     /// A silent main input must not bypass the sidechain-compression path: that path follows the
@@ -2466,14 +2592,6 @@ mod tests {
 
             // The downwards path is fully gated by the silent main input, but the upwards path
             // must not be: it follows the sidechain, so every non-DC bin gets compressed
-            eprintln!(
-                "DBG env1={} db={} thr={} ratio={} raw1={}",
-                bank.upwards.envelopes[0][1],
-                nih_plug::util::gain_to_db_fast_epsilon(bank.upwards.envelopes[0][1]),
-                bank.upwards.thresholds_db[1],
-                bank.upwards.ratios[1],
-                bank.upwards.raw_gain_difference_db[1]
-            );
             assert!(bank
                 .downwards
                 .raw_gain_difference_db
@@ -2494,16 +2612,21 @@ mod tests {
         let num_bins = window_size / 2 + 1;
         let (mut compressor_bank, _params, _frozen_ir_output_data) =
             make_bank_and_params(1, window_size);
-        compressor_bank.combined_raw_gain_difference_db[..num_bins].fill(0.0);
-        compressor_bank.combined_raw_gain_difference_db[3] = 18.0;
-        compressor_bank.combined_raw_gain_difference_db[4] = 18.0;
+        compressor_bank.downwards.raw_gain_difference_db[..num_bins].fill(0.0);
+        compressor_bank.downwards.raw_gain_difference_db[3] = 18.0;
+        compressor_bank.downwards.raw_gain_difference_db[4] = 18.0;
 
-        compressor_bank.smooth_gain_differences(1.0, 4, num_bins);
+        // Asserted through the combined curve: the DC clamp (which used to live inside the
+        // smoother) now guards the combined curve, so the positive smear below the first
+        // non-DC bin must still not reach the applied gain
+        compressor_bank.smooth_path_gain_differences(Path::Downwards, 1.0, num_bins);
+        compressor_bank.smooth_path_gain_differences(Path::Upwards, 1.0, num_bins);
+        compressor_bank.combine_and_clamp_gain_differences(4, num_bins);
 
-        assert!(compressor_bank.smoothed_gain_difference_db[1] <= 0.0);
-        assert!(compressor_bank.smoothed_gain_difference_db[2] <= 0.0);
-        assert!(compressor_bank.smoothed_gain_difference_db[3] <= 0.0);
-        assert!(compressor_bank.smoothed_gain_difference_db[4] > 0.0);
+        assert!(compressor_bank.combined_smoothed_gain_difference_db[1] <= 0.0);
+        assert!(compressor_bank.combined_smoothed_gain_difference_db[2] <= 0.0);
+        assert!(compressor_bank.combined_smoothed_gain_difference_db[3] <= 0.0);
+        assert!(compressor_bank.combined_smoothed_gain_difference_db[4] > 0.0);
     }
 
     #[test]
@@ -2512,10 +2635,14 @@ mod tests {
         let num_bins = window_size / 2 + 1;
         let (mut compressor_bank, _params, _frozen_ir_output_data) =
             make_bank_and_params(1, window_size);
-        compressor_bank.combined_raw_gain_difference_db[..num_bins].fill(0.0);
-        compressor_bank.combined_raw_gain_difference_db[16] = -24.0;
-        compressor_bank.smooth_gain_differences(1.0, 1, num_bins);
-        let smoothed_snapshot = compressor_bank.smoothed_gain_difference_db[..num_bins].to_vec();
+        compressor_bank.downwards.raw_gain_difference_db[..num_bins].fill(0.0);
+        compressor_bank.downwards.raw_gain_difference_db[16] = -24.0;
+        compressor_bank.smooth_path_gain_differences(Path::Downwards, 1.0, num_bins);
+        compressor_bank.upwards.raw_gain_difference_db.fill(0.0);
+        compressor_bank.smooth_path_gain_differences(Path::Upwards, 1.0, num_bins);
+        compressor_bank.combine_and_clamp_gain_differences(1, num_bins);
+        let smoothed_snapshot =
+            compressor_bank.combined_smoothed_gain_difference_db[..num_bins].to_vec();
         let mut buffer = make_complex_buffer(1.0, num_bins);
 
         compressor_bank.apply_gain_differences(&mut buffer, 0, true, true);
