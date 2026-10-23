@@ -29,8 +29,8 @@ use std::sync::Arc;
 use crate::analyzer::AnalyzerData;
 use crate::compressor_bank::{CompressorParams, ThresholdParams};
 use crate::curve::{
-    Curve, CurvePoint, THRESHOLD_CURVE_MAX_FREQUENCY_HZ, THRESHOLD_CURVE_MIN_FREQUENCY_HZ,
-    THRESHOLD_CURVE_POINT_OFFSET_LIMIT_DB,
+    Curve, CurveParams, CurvePoint, THRESHOLD_CURVE_MAX_FREQUENCY_HZ,
+    THRESHOLD_CURVE_MIN_FREQUENCY_HZ, THRESHOLD_CURVE_POINT_OFFSET_LIMIT_DB,
 };
 use crate::SpectralCompressorParams;
 
@@ -356,15 +356,38 @@ impl View for Analyzer {
         let analyzer_data = analyzer_data.read();
         let nyquist = self.sample_rate.load(Ordering::Relaxed) / 2.0;
 
-        draw_spectrum(cx, canvas, analyzer_data, nyquist);
+        // Hosts like Logic don't call `process()` while the transport is stopped, so on a
+        // freshly loaded instance this triple buffer still holds `Default::default()`. The
+        // spectrum and gain reduction traces are audio-driven, so those wait until real data
+        // arrives. The threshold curves are driven purely by the parameters, so they are drawn
+        // from the parameter lens below instead: the buffer's default curve parameters have a
+        // zero center frequency whose `ln(0.0)` turns the curve evaluation into NaN, which
+        // would otherwise leave the pane without any curves.
+        if analyzer_data.num_bins > 0 {
+            draw_spectrum(cx, canvas, analyzer_data, nyquist);
+            draw_gain_reduction(cx, canvas, analyzer_data, nyquist);
+        }
+
+        let downwards_threshold = &self.params.thresholds.downwards.threshold;
+        let upwards_threshold = &self.params.thresholds.upwards.threshold;
         draw_threshold_curve(
             cx,
             canvas,
-            analyzer_data,
+            downwards_threshold.curve_params(),
+            upwards_threshold.curve_params(),
+            self.params
+                .compressors
+                .downwards
+                .threshold_offset_db
+                .value(),
+            self.params
+                .compressors
+                .upwards
+                .threshold_offset_db
+                .value(),
             self.selected_curve_index(),
             self.editable_curve_display_offset_db(),
         );
-        draw_gain_reduction(cx, canvas, analyzer_data, nyquist);
         let label_font = self.frequency_guide_label_font.get().or_else(|| {
             canvas
                 .add_font_mem(assets::fonts::NOTO_SANS_LIGHT)
@@ -691,7 +714,10 @@ fn draw_spectrum_one(
 fn draw_threshold_curve(
     cx: &mut DrawContext,
     canvas: &mut Canvas,
-    analyzer_data: &AnalyzerData,
+    downwards_curve_params: CurveParams,
+    upwards_curve_params: CurveParams,
+    downwards_offset_db: f32,
+    upwards_offset_db: f32,
     selected_curve_index: usize,
     selected_display_offset_db: f32,
 ) {
@@ -737,22 +763,22 @@ fn draw_threshold_curve(
         canvas.reset_scissor();
     };
 
-    let (upwards_offset_db, downwards_offset_db) = analyzer_data.curve_offsets_db;
     draw_with_offset(
-        &Curve::new(&analyzer_data.curve_params[1]),
+        &Curve::new(&upwards_curve_params),
         upwards_offset_db,
         upwards_paint,
     );
     draw_with_offset(
-        &Curve::new(&analyzer_data.curve_params[0]),
+        &Curve::new(&downwards_curve_params),
         downwards_offset_db,
         downwards_paint,
     );
 
-    // Curve points are shown (and edited) only for the selected path
-    let curve = Curve::new(
-        &analyzer_data.curve_params[selected_curve_index.min(analyzer_data.curve_params.len() - 1)],
-    );
+    // The curve points are shown (and edited) only for the selected path
+    let curve = Curve::new(match selected_curve_index {
+        1 => &upwards_curve_params,
+        _ => &downwards_curve_params,
+    });
     draw_curve_points(cx, canvas, &curve, selected_display_offset_db);
 }
 
