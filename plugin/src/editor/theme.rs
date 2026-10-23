@@ -37,3 +37,6 @@ pub const ANALYZER_THRESHOLD_DOWNWARDS: vg::Color = vg::Color::rgbaf(0.902, 0.69
 pub const ANALYZER_THRESHOLD_UPWARDS: vg::Color = vg::Color::rgbaf(0.416, 0.784, 0.847, 0.9);
 pub const ANALYZER_THRESHOLD_POINT_FILL: vg::Color = vg::Color::rgbaf(0.137, 0.137, 0.137, 1.0);
 pub const ANALYZER_THRESHOLD_POINT_STROKE: vg::Color = vg::Color::rgbaf(0.96, 0.96, 0.96, 0.95);
+/// The translucent overlay for the upwards path's envelope trace, in the same hue as
+/// `ANALYZER_THRESHOLD_UPWARDS`.
+pub const ANALYZER_SPECTRUM_UPWARDS: vg::Color = vg::Color::rgbaf(0.416, 0.784, 0.847, 0.5);

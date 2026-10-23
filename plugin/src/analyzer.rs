@@ -27,42 +27,46 @@ use crate::curve::CurveParams;
 /// current window size is 2048, then only the first `2048 / 2 + 1` elements in the arrays are used.
 #[derive(Debug, Clone)]
 pub struct AnalyzerData {
-    /// The parameters used for the global threshold curve. This is used to draw the same curve used
-    /// by the compressors on the analyzer.
-    pub curve_params: CurveParams,
-    /// The upwards and downwards threshold offsets for the curve. These are used to draw the curve
-    /// twice with some distance between them if either is non-zero.
+    /// The parameters used for the two paths' threshold curves, indexed 0 = downwards, 1 =
+    /// upwards. This is used to draw the same curves used by the compressors on the analyzer.
+    pub curve_params: [CurveParams; 2],
+    /// The upwards and downwards threshold offsets for the curves. These are used to draw the
+    /// curves with some distance between them if either is non-zero.
     pub curve_offsets_db: (f32, f32),
 
     /// The number of used bins. This is part of the `AnalyzerData` since recomputing it in the
     /// editor could result in a race condition.
     pub num_bins: usize,
-    /// The amplitudes of all frequency bins in a windowed FFT of Spectral Compressor's output. Also
-    /// includes the DC offset bin which we don't draw, just to make this a bit less confusing.
+    /// The amplitudes of all frequency bins in a windowed FFT of Spectral Compressor's output,
+    /// followed per compression path. Also includes the DC offset bin which we don't draw, just
+    /// to make this a bit less confusing.
     ///
-    /// This data is taken directly from the envelope followers, so it has the same rise and fall
-    /// time as what is used by the compressors.
+    /// This data is taken directly from the paths' envelope followers, so it has the same rise
+    /// and fall time as what is used by the compressors.
     ///
-    /// Always sized to `MAX_WINDOW_SIZE / 2 + 1`. Heap-allocated to keep `Default::default()` from
-    /// blowing the stack (DAWs typically only give us a 1 MB UI thread stack and this struct is
-    /// triple-buffered).
-    pub envelope_followers: Vec<f32>,
+    /// Always sized to `MAX_WINDOW_SIZE / 2 + 1`. Heap-allocated to keep `Default::default()`
+    /// from blowing the stack (DAWs typically only give us a 1 MB UI thread stack and this struct
+    /// is triple-buffered).
+    pub envelope_followers_downwards: Vec<f32>,
+    /// The same as `envelope_followers_downwards`, but for the upwards compression path.
+    pub envelope_followers_upwards: Vec<f32>,
     /// The gain different applied to each band, in decibels. Alternatively, the negative gain
-    /// reduction. Positive values mean that a band becomes louder, and negative values mean a band
-    /// got attenuated. Does not (and should not) factor in the output gain.
+    /// reduction. Positive values mean that a band becomes louder, and negative values mean a
+    /// band got attenuated. Does not (and should not) factor in the output gain.
     ///
-    /// Always sized to `MAX_WINDOW_SIZE / 2 + 1`. See `envelope_followers` for why this is heap
-    /// allocated.
+    /// Always sized to `MAX_WINDOW_SIZE / 2 + 1`. See `envelope_followers_downwards` for why
+    /// this is heap allocated.
     pub gain_difference_db: Vec<f32>,
 }
 
 impl Default for AnalyzerData {
     fn default() -> Self {
         Self {
-            curve_params: CurveParams::default(),
+            curve_params: [CurveParams::default(), CurveParams::default()],
             curve_offsets_db: (0.0, 0.0),
             num_bins: 0,
-            envelope_followers: vec![0.0; crate::MAX_WINDOW_SIZE / 2 + 1],
+            envelope_followers_downwards: vec![0.0; crate::MAX_WINDOW_SIZE / 2 + 1],
+            envelope_followers_upwards: vec![0.0; crate::MAX_WINDOW_SIZE / 2 + 1],
             gain_difference_db: vec![0.0; crate::MAX_WINDOW_SIZE / 2 + 1],
         }
     }

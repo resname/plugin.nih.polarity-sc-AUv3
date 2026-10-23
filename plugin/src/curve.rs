@@ -59,6 +59,11 @@ impl<'a> Curve<'a> {
         }
     }
 
+    /// The parameters this curve was constructed from.
+    pub fn params(&self) -> &CurveParams {
+        self.params
+    }
+
     /// Evaluate the curve for the natural logarithm of the frequency value. This can be used as an
     /// optimization to avoid computing these logarithms all the time.
     #[inline]

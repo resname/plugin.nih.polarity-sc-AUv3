@@ -23,10 +23,11 @@ use nih_plug_vizia::vizia::prelude::*;
 use nih_plug_vizia::vizia::vg;
 use nih_plug_vizia::widgets::RawParamEvent;
 use std::cell::Cell;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 use crate::analyzer::AnalyzerData;
+use crate::compressor_bank::{CompressorParams, ThresholdParams};
 use crate::curve::{
     Curve, CurvePoint, THRESHOLD_CURVE_MAX_FREQUENCY_HZ, THRESHOLD_CURVE_MIN_FREQUENCY_HZ,
     THRESHOLD_CURVE_POINT_OFFSET_LIMIT_DB,
@@ -56,6 +57,8 @@ pub struct Analyzer {
     analyzer_data: Arc<AtomicRefCell<triple_buffer::Output<AnalyzerData>>>,
     sample_rate: Arc<AtomicF32>,
     params: Arc<SpectralCompressorParams>,
+    /// 0 = downwards path, 1 = upwards path. Shared with the selection row buttons.
+    selected_threshold_curve: Arc<AtomicU8>,
     frequency_guide_label_font: Cell<Option<vg::FontId>>,
     selected_point_index: Option<usize>,
     drag_active: bool,
@@ -63,20 +66,24 @@ pub struct Analyzer {
 
 impl Analyzer {
     /// Creates a new [`Analyzer`].
-    pub fn new<LAnalyzerData, LRate>(
+    #[allow(clippy::too_many_arguments)]
+    pub fn new<LAnalyzerData, LRate, LSelected>(
         cx: &mut Context,
         analyzer_data: LAnalyzerData,
         sample_rate: LRate,
         params: impl Lens<Target = Arc<SpectralCompressorParams>>,
+        selected_threshold_curve: LSelected,
     ) -> Handle<'_, Self>
     where
         LAnalyzerData: Lens<Target = Arc<AtomicRefCell<triple_buffer::Output<AnalyzerData>>>>,
         LRate: Lens<Target = Arc<AtomicF32>>,
+        LSelected: Lens<Target = Arc<AtomicU8>>,
     {
         Self {
             analyzer_data: analyzer_data.get(cx),
             sample_rate: sample_rate.get(cx),
             params: params.get(cx),
+            selected_threshold_curve: selected_threshold_curve.get(cx),
             frequency_guide_label_font: Cell::new(None),
             selected_point_index: None,
             drag_active: false,
@@ -88,18 +95,45 @@ impl Analyzer {
         )
     }
 
+    /// The index into the per-path arrays for the path whose curve points are being edited.
+    fn selected_curve_index(&self) -> usize {
+        (self.selected_threshold_curve.load(Ordering::Relaxed) != 0) as usize
+    }
+
+    /// The threshold curve parameters of the selected compression path.
+    fn selected_threshold(&self) -> &ThresholdParams {
+        match self.selected_curve_index() {
+            1 => &self.params.thresholds.upwards.threshold,
+            _ => &self.params.thresholds.downwards.threshold,
+        }
+    }
+
+    /// The per-path compressor parameters (e.g. the threshold offset) of the selected path.
+    fn selected_compressor(&self) -> &CompressorParams {
+        match self.selected_curve_index() {
+            1 => &self.params.compressors.upwards,
+            _ => &self.params.compressors.downwards,
+        }
+    }
+
+    /// The display offset for editing curve points: the selected path's own offset. Drawing
+    /// always keeps both curves at their own offsets.
+    fn editable_curve_display_offset_db(&self) -> f32 {
+        self.selected_compressor().threshold_offset_db.value()
+    }
+
     fn begin_drag(&mut self, cx: &mut EventContext, point_index: usize) {
         self.selected_point_index = Some(point_index);
         self.drag_active = true;
 
-        let point = &self.params.thresholds.downwards.threshold.curve_points[point_index];
+        let point = &self.selected_threshold().curve_points[point_index];
         Self::emit_begin(cx, &point.frequency);
         Self::emit_begin(cx, &point.offset_db);
     }
 
     fn finish_drag(&mut self, cx: &mut EventContext) {
         if let Some(point_index) = self.selected_point_index {
-            let point = &self.params.thresholds.downwards.threshold.curve_points[point_index];
+            let point = &self.selected_threshold().curve_points[point_index];
             Self::emit_end(cx, &point.frequency);
             Self::emit_end(cx, &point.offset_db);
         }
@@ -111,17 +145,14 @@ impl Analyzer {
     }
 
     fn first_free_point_index(&self) -> Option<usize> {
-        self.params
-            .thresholds
-            .downwards
-            .threshold
+        self.selected_threshold()
             .curve_points
             .iter()
             .position(|point| !point.enabled.value())
     }
 
     fn set_point_enabled(&self, cx: &mut EventContext, point_index: usize, enabled: bool) {
-        let point = &self.params.thresholds.downwards.threshold.curve_points[point_index];
+        let point = &self.selected_threshold().curve_points[point_index];
         Self::emit_begin(cx, &point.enabled);
         Self::emit_set(cx, &point.enabled, enabled);
         Self::emit_end(cx, &point.enabled);
@@ -134,7 +165,7 @@ impl Analyzer {
         frequency: f32,
         offset_db: f32,
     ) {
-        let point = &self.params.thresholds.downwards.threshold.curve_points[point_index];
+        let point = &self.selected_threshold().curve_points[point_index];
         Self::emit_set(cx, &point.frequency, frequency);
         Self::emit_set(cx, &point.offset_db, offset_db);
     }
@@ -150,7 +181,7 @@ impl Analyzer {
             return None;
         }
 
-        let curve_params = self.params.thresholds.downwards.threshold.curve_params();
+        let curve_params = self.selected_threshold().curve_params();
         let curve = Curve::new(&curve_params);
         let display_offset_db = self.editable_curve_display_offset_db();
         let hit_radius = scale_factor * 8.0;
@@ -199,7 +230,7 @@ impl Analyzer {
             THRESHOLD_CURVE_MAX_FREQUENCY_HZ,
         );
         let clicked_db = display_db_to_raw_db(unclamped_t_to_db(y_t), ln_freq);
-        let curve_params = self.params.thresholds.downwards.threshold.curve_params();
+        let curve_params = self.selected_threshold().curve_params();
         let curve = Curve::new(&curve_params);
         let offset_db = (clicked_db
             - self.editable_curve_display_offset_db()
@@ -210,18 +241,6 @@ impl Analyzer {
         );
 
         (frequency, offset_db)
-    }
-
-    fn editable_curve_display_offset_db(&self) -> f32 {
-        let upwards_offset_db = self.params.compressors.upwards.threshold_offset_db.value();
-        let downwards_offset_db = self
-            .params
-            .compressors
-            .downwards
-            .threshold_offset_db
-            .value();
-
-        (upwards_offset_db + downwards_offset_db) * 0.5
     }
 
     fn emit_begin<P: Param>(cx: &mut EventContext, param: &P) {
@@ -338,7 +357,13 @@ impl View for Analyzer {
         let nyquist = self.sample_rate.load(Ordering::Relaxed) / 2.0;
 
         draw_spectrum(cx, canvas, analyzer_data, nyquist);
-        draw_threshold_curve(cx, canvas, analyzer_data);
+        draw_threshold_curve(
+            cx,
+            canvas,
+            analyzer_data,
+            self.selected_curve_index(),
+            self.editable_curve_display_offset_db(),
+        );
         draw_gain_reduction(cx, canvas, analyzer_data, nyquist);
         let label_font = self.frequency_guide_label_font.get().or_else(|| {
             canvas
@@ -396,11 +421,6 @@ fn raw_db_to_display_db(raw_db: f32, ln_frequency: f32) -> f32 {
 #[inline]
 fn display_db_to_raw_db(display_db: f32, ln_frequency: f32) -> f32 {
     display_db - visual_tilt_offset_db(ln_frequency)
-}
-
-fn editable_curve_display_offset_db(analyzer_data: &AnalyzerData) -> f32 {
-    let (upwards_offset_db, downwards_offset_db) = analyzer_data.curve_offsets_db;
-    (upwards_offset_db + downwards_offset_db) * 0.5
 }
 
 #[inline]
@@ -508,25 +528,64 @@ fn point_screen_position(
     ))
 }
 
-/// Draw the spectrum analyzer part of the analyzer. These are drawn as vertical bars until the
-/// spacing between the bars becomes less the line width, at which point it's drawn as a solid mesh
-/// instead.
+/// Draw the spectrum analyzer part of the analyzer. The downwards path's trace is drawn with full
+/// opacity, and the upwards path's trace is overlaid on top with a translucent tint. These are
+/// drawn as vertical bars until the spacing between the bars becomes less the line width, at which
+/// point they're drawn as a solid mesh instead.
 fn draw_spectrum(
     cx: &mut DrawContext,
     canvas: &mut Canvas,
     analyzer_data: &AnalyzerData,
     nyquist_hz: f32,
 ) {
+    // The main spectrum trace
+    canvas.global_composite_blend_func(vg::BlendFactor::One, vg::BlendFactor::OneMinusSrcAlpha);
+    draw_spectrum_one(
+        cx,
+        canvas,
+        analyzer_data,
+        nyquist_hz,
+        &analyzer_data.envelope_followers_downwards,
+        theme::ANALYZER_SPECTRUM_BARS,
+        theme::ANALYZER_SPECTRUM_MESH_LIGHT,
+        theme::ANALYZER_SPECTRUM_MESH_DARK,
+    );
+
+    // The upwards path's trace is a translucent overlay in its own color
+    let upwards_color = theme::ANALYZER_SPECTRUM_UPWARDS;
+    canvas
+        .global_composite_blend_func(vg::BlendFactor::SrcAlpha, vg::BlendFactor::OneMinusSrcAlpha);
+    draw_spectrum_one(
+        cx,
+        canvas,
+        analyzer_data,
+        nyquist_hz,
+        &analyzer_data.envelope_followers_upwards,
+        upwards_color,
+        upwards_color,
+        upwards_color,
+    );
+    canvas.global_composite_blend_func(vg::BlendFactor::One, vg::BlendFactor::OneMinusSrcAlpha);
+}
+
+/// The bars and mesh drawing for a single spectrum trace. The colors are passed in so the
+/// upwards trace can reuse the same segmenting algorithm with its own tint.
+#[allow(clippy::too_many_arguments)]
+fn draw_spectrum_one(
+    cx: &mut DrawContext,
+    canvas: &mut Canvas,
+    analyzer_data: &AnalyzerData,
+    nyquist_hz: f32,
+    magnitudes: &[f32],
+    bars_color: vg::Color,
+    mesh_light_color: vg::Color,
+    mesh_dark_color: vg::Color,
+) {
     let bounds = cx.bounds();
 
     let line_width = cx.scale_factor() * 1.5;
-    let spectrum_color = theme::ANALYZER_SPECTRUM_BARS;
     // This is used to draw the individual bars
-    let bars_paint = vg::Paint::color(spectrum_color).with_line_width(line_width);
-    // These colors are used to draw the mesh part of the spectrum. A gradient fades from the
-    // lighter variant on the left to the darker variant on the right.
-    let lighter_spectrum_color = theme::ANALYZER_SPECTRUM_MESH_LIGHT;
-    let darker_spectrum_color = theme::ANALYZER_SPECTRUM_MESH_DARK;
+    let bars_paint = vg::Paint::color(bars_color).with_line_width(line_width);
 
     // The frequency belonging to a bin in Hz
     let bin_frequency = |bin_idx: f32| (bin_idx / analyzer_data.num_bins as f32) * nyquist_hz;
@@ -549,12 +608,7 @@ fn draw_spectrum(
     let mut previous_physical_x_coord = bounds.x - 2.0;
 
     let mut bars_path = vg::Path::new();
-    for (bin_idx, magnitude) in analyzer_data
-        .envelope_followers
-        .iter()
-        .enumerate()
-        .take(analyzer_data.num_bins)
-    {
+    for (bin_idx, magnitude) in magnitudes.iter().enumerate().take(analyzer_data.num_bins) {
         let t = bin_t(bin_idx as f32);
         if t <= 0.0 || t >= 1.0 {
             continue;
@@ -588,8 +642,7 @@ fn draw_spectrum(
     let mesh_start_y_coordinate = bounds.y + bounds.h;
 
     mesh_path.move_to(mesh_start_x_coordiante, mesh_start_y_coordinate);
-    for (bin_idx, magnitude) in analyzer_data
-        .envelope_followers
+    for (bin_idx, magnitude) in magnitudes
         .iter()
         .enumerate()
         .take(analyzer_data.num_bins)
@@ -623,18 +676,25 @@ fn draw_spectrum(
         previous_physical_x_coord,
         0.0,
         [
-            (0.0, lighter_spectrum_color),
-            (0.707, darker_spectrum_color),
-            (1.0, darker_spectrum_color),
+            (0.0, mesh_light_color),
+            (0.707, mesh_dark_color),
+            (1.0, mesh_dark_color),
         ],
     )
     .with_anti_alias(false);
     canvas.fill_path(&mesh_path, &mesh_paint);
 }
 
-/// Overlays the threshold curve over the spectrum analyzer. If either the upwards or downwards
-/// threshold offsets are non-zero then two curves are drawn.
-fn draw_threshold_curve(cx: &mut DrawContext, canvas: &mut Canvas, analyzer_data: &AnalyzerData) {
+/// Overlays the threshold curves over the spectrum analyzer. Each path draws its own curve at its
+/// own offset, and the curve points are shown only for the selected path.
+#[allow(clippy::too_many_arguments)]
+fn draw_threshold_curve(
+    cx: &mut DrawContext,
+    canvas: &mut Canvas,
+    analyzer_data: &AnalyzerData,
+    selected_curve_index: usize,
+    selected_display_offset_db: f32,
+) {
     let bounds = cx.bounds();
 
     let line_width = cx.scale_factor() * 3.0;
@@ -646,10 +706,9 @@ fn draw_threshold_curve(cx: &mut DrawContext, canvas: &mut Canvas, analyzer_data
     // This can be done slightly cleverer but for our purposes drawing line segments that are either
     // 1 pixel apart or that split the curve up into 100 segments (whichever results in the least
     // amount of line segments) should be sufficient
-    let curve = Curve::new(&analyzer_data.curve_params);
     let num_points = 100.min(bounds.w.ceil() as usize);
 
-    let mut draw_with_offset = |offset_db: f32, paint: vg::Paint| {
+    let mut draw_with_offset = |curve: &Curve, offset_db: f32, paint: vg::Paint| {
         let mut path = vg::Path::new();
         for i in 0..num_points {
             let x_t = i as f32 / (num_points - 1) as f32;
@@ -679,27 +738,39 @@ fn draw_threshold_curve(cx: &mut DrawContext, canvas: &mut Canvas, analyzer_data
     };
 
     let (upwards_offset_db, downwards_offset_db) = analyzer_data.curve_offsets_db;
-    draw_with_offset(upwards_offset_db, upwards_paint);
-    draw_with_offset(downwards_offset_db, downwards_paint);
-    draw_curve_points(cx, canvas, analyzer_data, &curve);
+    draw_with_offset(
+        &Curve::new(&analyzer_data.curve_params[1]),
+        upwards_offset_db,
+        upwards_paint,
+    );
+    draw_with_offset(
+        &Curve::new(&analyzer_data.curve_params[0]),
+        downwards_offset_db,
+        downwards_paint,
+    );
+
+    // Curve points are shown (and edited) only for the selected path
+    let curve = Curve::new(
+        &analyzer_data.curve_params[selected_curve_index.min(analyzer_data.curve_params.len() - 1)],
+    );
+    draw_curve_points(cx, canvas, &curve, selected_display_offset_db);
 }
 
 fn draw_curve_points(
     cx: &mut DrawContext,
     canvas: &mut Canvas,
-    analyzer_data: &AnalyzerData,
     curve: &Curve,
+    display_offset_db: f32,
 ) {
     let bounds = cx.bounds();
     let radius = cx.scale_factor() * 4.5;
     let stroke_width = cx.scale_factor() * 1.5;
-    let display_offset_db = editable_curve_display_offset_db(analyzer_data);
     let fill_paint = vg::Paint::color(theme::ANALYZER_THRESHOLD_POINT_FILL);
     let stroke_paint =
         vg::Paint::color(theme::ANALYZER_THRESHOLD_POINT_STROKE).with_line_width(stroke_width);
 
     canvas.scissor(bounds.x, bounds.y, bounds.w, bounds.h);
-    for point in &analyzer_data.curve_params.points {
+    for point in &curve.params().points {
         let Some((x, y)) = point_screen_position(bounds, curve, point, display_offset_db) else {
             continue;
         };

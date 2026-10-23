@@ -21,7 +21,7 @@ use nih_plug_vizia::vizia::prelude::*;
 use nih_plug_vizia::widgets::*;
 use nih_plug_vizia::{assets, create_vizia_editor, ViziaState, ViziaTheming};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 #[cfg(feature = "hot-reload")]
@@ -81,6 +81,9 @@ pub(crate) struct Data {
     pub(crate) frozen_ir_data: Arc<AtomicRefCell<triple_buffer::Output<FrozenIrData>>>,
     /// Used by the analyzer to determine which FFT bins belong to which frequencies.
     pub(crate) sample_rate: Arc<AtomicF32>,
+    /// Which path's threshold curve the analyzer edits and shows curve points for. 0 = downwards,
+    /// 1 = upwards. GUI-local state, not persisted.
+    pub(crate) selected_threshold_curve: Arc<AtomicU8>,
 }
 
 impl Model for Data {}
@@ -922,7 +925,77 @@ fn downwards_column(cx: &mut Context) {
 
 /// Creates the analyzer panel on the right side of the editor.
 fn analyzer_column(cx: &mut Context) {
-    Analyzer::new(cx, Data::analyzer_data, Data::sample_rate, Data::params);
+    HStack::new(cx, |cx| {
+        // The analyzer shows and edits the curve points of the selected path
+        ThresholdCurveSelectButton::new(cx, Data::selected_threshold_curve, 0, "Down")
+            .class("threshold-curve-button");
+        ThresholdCurveSelectButton::new(cx, Data::selected_threshold_curve, 1, "Up")
+            .class("threshold-curve-button");
+    })
+    .class("curve-matching-button-group");
+    Analyzer::new(
+        cx,
+        Data::analyzer_data,
+        Data::sample_rate,
+        Data::params,
+        Data::selected_threshold_curve,
+    );
+}
+
+/// A button that stores which compression path's threshold curve the analyzer edits.
+struct ThresholdCurveSelectButton {
+    selected_threshold_curve: Arc<AtomicU8>,
+    curve_index: u8,
+}
+
+impl ThresholdCurveSelectButton {
+    pub fn new<LSelected, T>(
+        cx: &mut Context,
+        selected_threshold_curve: LSelected,
+        curve_index: u8,
+        label: impl Res<T> + Clone,
+    ) -> Handle<'_, Self>
+    where
+        LSelected: Lens<Target = Arc<AtomicU8>>,
+        T: ToString,
+    {
+        let handle = Self {
+            selected_threshold_curve: selected_threshold_curve.get(cx),
+            curve_index,
+        }
+        .build(cx, |cx| {
+            Label::new(cx, label).hoverable(false);
+        })
+        .class("editor-mode");
+
+        // Grey the button out while its path is already selected
+        handle.disabled(
+            selected_threshold_curve
+                .map(move |selected| selected.load(Ordering::Relaxed) == curve_index),
+        )
+    }
+}
+
+impl View for ThresholdCurveSelectButton {
+    fn element(&self) -> Option<&'static str> {
+        Some("param-button")
+    }
+
+    fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
+        event.map(|window_event, meta| match window_event {
+            WindowEvent::MouseDown(MouseButton::Left)
+            | WindowEvent::MouseDoubleClick(MouseButton::Left)
+            | WindowEvent::MouseTripleClick(MouseButton::Left) => {
+                meta.consume();
+                if cx.is_disabled() {
+                    return;
+                }
+                self.selected_threshold_curve
+                    .store(self.curve_index, Ordering::Relaxed);
+            }
+            _ => {}
+        });
+    }
 }
 
 fn curve_preset_options(entries: &[CurvePresetEntry]) -> Vec<String> {

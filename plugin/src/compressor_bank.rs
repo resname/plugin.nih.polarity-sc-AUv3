@@ -1115,8 +1115,12 @@ impl CompressorBank {
         if should_update_analyzer_data && channel_idx == num_channels - 1 {
             let analyzer_input_data = self.analyzer_input_data.input_buffer();
 
-            // The editor needs to know about this too so it can draw the spectra correctly
-            analyzer_input_data.curve_params = params.thresholds.downwards.threshold.curve_params();
+            // The editor needs to know about this too so it can draw the spectra correctly: the
+            // curves and offsets are now carried per path (0 = downwards, 1 = upwards)
+            analyzer_input_data.curve_params = [
+                params.thresholds.downwards.threshold.curve_params(),
+                params.thresholds.upwards.threshold.curve_params(),
+            ];
             analyzer_input_data.curve_offsets_db = (
                 params.compressors.upwards.threshold_offset_db.value(),
                 params.compressors.downwards.threshold_offset_db.value(),
@@ -1129,23 +1133,32 @@ impl CompressorBank {
                 *gain_difference_db *= channel_multiplier;
             }
 
-            // The spectrum analyzer data has not yet been added. Transitional until the analyzer
-            // data is split per path: draw the average of the two paths' envelopes.
+            // The spectrum analyzer data is carried per path: each path's channel-average
+            // envelope trace goes to its own field
             assert!(self.downwards.envelopes.len() == num_channels);
             assert!(self.downwards.envelopes[0].len() >= num_bins);
-            for (bin_idx, spectrum_data) in analyzer_input_data.envelope_followers[..num_bins]
-                .iter_mut()
-                .enumerate()
-            {
-                *spectrum_data = 0.0;
-                for channel_idx in 0..num_channels {
-                    let downwards_envelope = self.downwards.envelopes[channel_idx][bin_idx];
-                    let upwards_envelope = self.upwards.envelopes[channel_idx][bin_idx];
-                    let average = (downwards_envelope + upwards_envelope) * 0.5;
-                    *spectrum_data += average;
-                }
+            for (path, trace) in [
+                (
+                    Path::Downwards,
+                    &mut analyzer_input_data.envelope_followers_downwards,
+                ),
+                (
+                    Path::Upwards,
+                    &mut analyzer_input_data.envelope_followers_upwards,
+                ),
+            ] {
+                for (bin_idx, spectrum_data) in trace[..num_bins].iter_mut().enumerate() {
+                    *spectrum_data = 0.0;
+                    for channel_idx in 0..num_channels {
+                        let path_state = match path {
+                            Path::Downwards => &self.downwards,
+                            Path::Upwards => &self.upwards,
+                        };
+                        *spectrum_data += path_state.envelopes[channel_idx][bin_idx];
+                    }
 
-                *spectrum_data *= channel_multiplier;
+                    *spectrum_data *= channel_multiplier;
+                }
             }
 
             // After filling the object with data it can be sent to the editor. This happens
@@ -1972,7 +1985,24 @@ mod tests {
         SpectralCompressorParams,
         triple_buffer::Output<FrozenIrData>,
     ) {
-        let (analyzer_input_data, _analyzer_output_data) =
+        let (bank, params, frozen_ir_output_data, _analyzer_output_data) =
+            make_bank_and_params_with_analyzer(num_channels, window_size);
+
+        (bank, params, frozen_ir_output_data)
+    }
+
+    /// The same as [`make_bank_and_params()`], but the analyzer output triple buffer is also
+    /// returned so tests can read the published analyzer data.
+    fn make_bank_and_params_with_analyzer(
+        num_channels: usize,
+        window_size: usize,
+    ) -> (
+        CompressorBank,
+        SpectralCompressorParams,
+        triple_buffer::Output<FrozenIrData>,
+        triple_buffer::Output<AnalyzerData>,
+    ) {
+        let (analyzer_input_data, analyzer_output_data) =
             TripleBuffer::<AnalyzerData>::default().split();
         let (frozen_ir_input_data, frozen_ir_output_data) =
             TripleBuffer::<FrozenIrData>::default().split();
@@ -1991,7 +2021,12 @@ mod tests {
 
         let params = SpectralCompressorParams::new(&compressor_bank);
 
-        (compressor_bank, params, frozen_ir_output_data)
+        (
+            compressor_bank,
+            params,
+            frozen_ir_output_data,
+            analyzer_output_data,
+        )
     }
 
     fn configure_test_downwards_compression(
@@ -3058,6 +3093,63 @@ mod tests {
             match result {
                 MatchCurveResult::Matched(fit) => assert_eq!(fit.slope, -3.0),
                 MatchCurveResult::Failed => panic!("fitting failed"),
+            }
+        });
+    }
+
+    #[test]
+    fn analyzer_curve_params_are_per_path() {
+        run_with_large_stack(|| {
+            let window_size = 64;
+            let (mut bank, params, _ir, mut analyzer_output_data) =
+                make_bank_and_params_with_analyzer(1, window_size);
+            let num_bins = window_size / 2 + 1;
+
+            // Two distinct threshold curves so the published data must carry both intercepts
+            params
+                .thresholds
+                .downwards
+                .threshold
+                .threshold_db
+                .set_plain_value(-24.0);
+            params
+                .thresholds
+                .upwards
+                .threshold
+                .threshold_db
+                .set_plain_value(-40.0);
+            // Distinct envelope trace timings so the two traces differ: with the same magnitudes
+            // in every pass the envelopes would sit exactly on them, so the upwards path gets a
+            // much slower attack. The timing scale is pinned at 1.0 (its fade-in would otherwise
+            // zero the attack times on the first pass).
+            params
+                .thresholds
+                .downwards
+                .compressor_attack_ms
+                .set_plain_value(1.0);
+            params
+                .thresholds
+                .upwards
+                .compressor_attack_ms
+                .set_plain_value(100_000.0);
+            bank.envelope_followers_timing_scale = 1.0;
+            params.editor_state.set_open(true);
+
+            let mut buffer = make_complex_buffer(1.0, num_bins);
+            bank.process(&mut buffer, 0, &params, 4, 1);
+            bank.publish_analyzer_if_needed();
+
+            let data = analyzer_output_data.read().clone();
+            assert_eq!(data.curve_params[0].intercept, -24.0);
+            assert_eq!(data.curve_params[1].intercept, -40.0);
+            // The traces are per path: the upwards path's slower attack leaves its envelope
+            // well below the downwards trace on this short window
+            for bin_idx in 1..num_bins {
+                assert!(
+                    data.envelope_followers_downwards[bin_idx]
+                        > data.envelope_followers_upwards[bin_idx],
+                    "envelope traces do not split per path at bin {bin_idx}"
+                );
             }
         });
     }

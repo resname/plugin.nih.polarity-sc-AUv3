@@ -332,6 +332,7 @@ impl Plugin for SpectralCompressor {
                 analyzer_data: self.analyzer_output_data.clone(),
                 frozen_ir_data: self.frozen_ir_output_data.clone(),
                 sample_rate: self.sample_rate.clone(),
+                selected_threshold_curve: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             },
         )
     }

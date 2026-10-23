@@ -186,4 +186,11 @@ impl ViziaState {
     pub fn is_open(&self) -> bool {
         self.open.load(Ordering::Acquire)
     }
+
+    /// Manually mark the GUI as open or closed. Normally the host drives this through
+    /// `set_size()`/editor cleanup, but tests (and standalone code) may need to flip this from the
+    /// outside.
+    pub fn set_open(&self, open: bool) {
+        self.open.store(open, Ordering::Release);
+    }
 }
