@@ -96,8 +96,12 @@ impl Model for Data {}
 struct ExportUiModel {
     can_export: bool,
     status_text: String,
-    selected_curve_preset_index: usize,
-    can_delete_curve_preset: bool,
+    /// The picklist selection of each column's "Curve Presets" control; per path, since the
+    /// curves they apply to are edited per path.
+    selected_curve_preset_index_downwards: usize,
+    selected_curve_preset_index_upwards: usize,
+    can_delete_curve_preset_downwards: bool,
+    can_delete_curve_preset_upwards: bool,
     curve_preset_options: Vec<String>,
     curve_preset_entries: Vec<CurvePresetEntry>,
     frozen_ir_data: Arc<AtomicRefCell<triple_buffer::Output<FrozenIrData>>>,
@@ -122,8 +126,10 @@ impl ExportUiModel {
         Self {
             can_export,
             status_text: String::new(),
-            selected_curve_preset_index: 0,
-            can_delete_curve_preset: false,
+            selected_curve_preset_index_downwards: 0,
+            selected_curve_preset_index_upwards: 0,
+            can_delete_curve_preset_downwards: false,
+            can_delete_curve_preset_upwards: false,
             curve_preset_options,
             curve_preset_entries: loaded_presets.entries,
             frozen_ir_data,
@@ -154,7 +160,7 @@ enum CurvePresetEvent {
     Apply(usize, CompressionPath),
     SaveRequested(CompressionPath),
     SaveDialogFinished(Option<PathBuf>, CompressionPath),
-    DeleteSelected,
+    DeleteSelected(CompressionPath),
 }
 
 #[derive(Clone, Copy)]
@@ -206,7 +212,7 @@ impl View for CurvePresetButton {
                         cx.emit(CurvePresetEvent::SaveRequested(self.path))
                     }
                     CurvePresetButtonAction::DeleteSelected => {
-                        cx.emit(CurvePresetEvent::DeleteSelected)
+                        cx.emit(CurvePresetEvent::DeleteSelected(self.path))
                     }
                 }
             }
@@ -257,7 +263,7 @@ impl Model for ExportUiModel {
                         MatchCurveResult::Matched(fit) => {
                             self.apply_match_curve(*fit, *path);
                             cx.emit(RawParamEvent::ParametersChanged);
-                            self.selected_curve_preset_index = 0;
+                            self.set_selected_curve_preset_index(*path, 0);
                             self.refresh_curve_preset_delete_enabled();
                             self.status_text = String::from("Curve matched");
                         }
@@ -272,7 +278,7 @@ impl Model for ExportUiModel {
                 match_curve_button::MatchCurveEvent::ClearRequested(path) => {
                     self.clear_match_curve(*path);
                     cx.emit(RawParamEvent::ParametersChanged);
-                    self.selected_curve_preset_index = 0;
+                    self.set_selected_curve_preset_index(*path, 0);
                     self.refresh_curve_preset_delete_enabled();
                     self.status_text = String::from("Curve cleared");
                     self.refresh_export_availability();
@@ -291,7 +297,7 @@ impl Model for ExportUiModel {
                         let preset = entry.preset.clone();
                         let source = entry.source;
                         self.apply_curve_preset(preset.clone(), source, *path);
-                        self.selected_curve_preset_index = *index;
+                        self.set_selected_curve_preset_index(*path, *index);
                         self.refresh_curve_preset_delete_enabled();
                         cx.emit(RawParamEvent::ParametersChanged);
                         self.status_text = format!("Applied: {}", preset.name);
@@ -322,24 +328,24 @@ impl Model for ExportUiModel {
                     let preset = self.current_curve_preset(*save_path);
                     match save_user_preset_to_path(path, preset) {
                         Ok(entry) => {
-                            self.upsert_user_preset(entry);
+                            self.upsert_user_preset(entry, *save_path);
                             self.curve_preset_options =
                                 curve_preset_options(&self.curve_preset_entries);
                             self.refresh_curve_preset_delete_enabled();
                             let name = self
-                                .selected_curve_preset_name()
+                                .selected_curve_preset_name(*save_path)
                                 .unwrap_or_else(|| String::from("Preset"));
                             self.status_text = format!("Saved preset: {name}");
                         }
                         Err(err) => {
-                            self.selected_curve_preset_index = 0;
+                            self.set_selected_curve_preset_index(*save_path, 0);
                             self.refresh_curve_preset_delete_enabled();
                             self.status_text = format!("Save failed: {err}");
                         }
                     }
                 }
-                CurvePresetEvent::DeleteSelected => {
-                    let Some(entry) = self.selected_user_curve_preset_entry().cloned() else {
+                CurvePresetEvent::DeleteSelected(path) => {
+                    let Some(entry) = self.selected_user_curve_preset_entry(*path).cloned() else {
                         self.status_text = String::from("Select a user preset to delete");
                         return;
                     };
@@ -353,7 +359,11 @@ impl Model for ExportUiModel {
                             });
                             self.curve_preset_options =
                                 curve_preset_options(&self.curve_preset_entries);
-                            self.selected_curve_preset_index = 0;
+                            // The removed entry invalidates the lists' indices; resetting both
+                            // columns' selection to the "Preset..." placeholder is the simple
+                            // consistent behavior.
+                            self.selected_curve_preset_index_downwards = 0;
+                            self.selected_curve_preset_index_upwards = 0;
                             self.refresh_curve_preset_delete_enabled();
                             self.status_text = format!("Deleted preset: {name}");
                         }
@@ -493,29 +503,49 @@ impl ExportUiModel {
         }
     }
 
-    fn selected_curve_preset_entry(&self) -> Option<&CurvePresetEntry> {
-        self.selected_curve_preset_index
+    fn selected_curve_preset_index(&self, path: CompressionPath) -> usize {
+        match path {
+            CompressionPath::Downwards => self.selected_curve_preset_index_downwards,
+            CompressionPath::Upwards => self.selected_curve_preset_index_upwards,
+        }
+    }
+
+    fn set_selected_curve_preset_index(&mut self, path: CompressionPath, index: usize) {
+        match path {
+            CompressionPath::Downwards => self.selected_curve_preset_index_downwards = index,
+            CompressionPath::Upwards => self.selected_curve_preset_index_upwards = index,
+        }
+    }
+
+    fn selected_curve_preset_entry(&self, path: CompressionPath) -> Option<&CurvePresetEntry> {
+        self.selected_curve_preset_index(path)
             .checked_sub(1)
             .and_then(|index| self.curve_preset_entries.get(index))
     }
 
-    fn selected_user_curve_preset_entry(&self) -> Option<&CurvePresetEntry> {
-        self.selected_curve_preset_entry()
+    fn selected_user_curve_preset_entry(&self, path: CompressionPath) -> Option<&CurvePresetEntry> {
+        self.selected_curve_preset_entry(path)
             .filter(|entry| entry.source == CurvePresetSource::User)
     }
 
-    fn selected_curve_preset_name(&self) -> Option<String> {
-        self.selected_curve_preset_entry()
+    fn selected_curve_preset_name(&self, path: CompressionPath) -> Option<String> {
+        self.selected_curve_preset_entry(path)
             .map(|entry| entry.preset.name.clone())
     }
 
     fn refresh_curve_preset_delete_enabled(&mut self) {
-        self.can_delete_curve_preset = self
-            .selected_curve_preset_entry()
-            .is_some_and(|entry| entry.source == CurvePresetSource::User);
+        for path in [CompressionPath::Downwards, CompressionPath::Upwards] {
+            let can_delete = self
+                .selected_curve_preset_entry(path)
+                .is_some_and(|entry| entry.source == CurvePresetSource::User);
+            match path {
+                CompressionPath::Downwards => self.can_delete_curve_preset_downwards = can_delete,
+                CompressionPath::Upwards => self.can_delete_curve_preset_upwards = can_delete,
+            }
+        }
     }
 
-    fn upsert_user_preset(&mut self, entry: CurvePresetEntry) {
+    fn upsert_user_preset(&mut self, entry: CurvePresetEntry, path: CompressionPath) {
         let name = entry.preset.name.clone();
         self.curve_preset_entries.retain(|existing| {
             existing.source != CurvePresetSource::User || existing.preset.name != name
@@ -530,12 +560,13 @@ impl ExportUiModel {
         self.curve_preset_entries[built_in_count..]
             .sort_by(|left, right| left.preset.name.cmp(&right.preset.name));
 
-        self.selected_curve_preset_index = self
+        let selected_index = self
             .curve_preset_entries
             .iter()
             .position(|entry| entry.source == CurvePresetSource::User && entry.preset.name == name)
             .map(|index| index + 1)
             .unwrap_or(0);
+        self.set_selected_curve_preset_index(path, selected_index);
     }
 
     fn apply_curve_preset(&self, preset: CurvePreset, source: CurvePresetSource, path: CompressionPath) {
@@ -991,25 +1022,23 @@ fn path_column(cx: &mut Context, path: CompressionPath) {
                 HStack::new(cx, |cx| {
                     Label::new(cx, "Curve Presets").class("label");
                     HStack::new(cx, |cx| {
-                        curve_preset_picklist(cx, path);
-                        CurvePresetButton::new(
-                            cx,
-                            CurvePresetButtonAction::SaveRequested,
-                            path,
-                            "Save",
-                        )
-                        .class("curve-preset-button");
-                        CurvePresetButton::new(
-                            cx,
-                            CurvePresetButtonAction::DeleteSelected,
-                            path,
-                            "Del",
-                        )
-                        .disabled(
-                                ExportUiModel::can_delete_curve_preset
-                                    .map(|can_delete| !*can_delete),
-                            )
-                            .class("curve-preset-button");
+                        // The selection state is per path: each column's picklist lenses its
+                        // own model field, picked through a generic helper because the two
+                        // lens constants don't unify in a match.
+                        match path {
+                            CompressionPath::Downwards => curve_preset_controls(
+                                cx,
+                                path,
+                                ExportUiModel::selected_curve_preset_index_downwards,
+                                ExportUiModel::can_delete_curve_preset_downwards,
+                            ),
+                            CompressionPath::Upwards => curve_preset_controls(
+                                cx,
+                                path,
+                                ExportUiModel::selected_curve_preset_index_upwards,
+                                ExportUiModel::can_delete_curve_preset_upwards,
+                            ),
+                        }
                     })
                     .class("curve-preset-control-group");
                 })
@@ -1151,27 +1180,50 @@ fn curve_preset_options(entries: &[CurvePresetEntry]) -> Vec<String> {
     options
 }
 
-fn curve_preset_picklist(cx: &mut Context, path: CompressionPath) {
-    PickList::new(
-        cx,
-        ExportUiModel::curve_preset_options,
-        ExportUiModel::selected_curve_preset_index,
-        true,
-    )
-    .class("curve-preset-picklist")
-    .tooltip(|cx| {
-        Label::new(
-            cx,
-            "Threshold curve presets change the displayed threshold curve shape.",
-        );
-    })
-    .on_select(move |cx, index| {
-        if index == 0 {
-            return;
-        }
+/// Renders one column's "Curve Presets" row contents: the picklist plus the Save/Del buttons,
+/// lensed on the path's own selection state. Generic over the two lenses so the per-field
+/// lens constants from the `Lens` derive don't need to unify.
+fn curve_preset_controls<LSelected, LCanDelete>(
+    cx: &mut Context,
+    path: CompressionPath,
+    selected_lens: LSelected,
+    can_delete_lens: LCanDelete,
+) where
+    LSelected: Lens<Target = usize>,
+    LCanDelete: Lens<Target = bool>,
+{
+    PickList::new(cx, ExportUiModel::curve_preset_options, selected_lens, true)
+        .class("curve-preset-picklist")
+        .tooltip(|cx| {
+            Label::new(
+                cx,
+                "Threshold curve presets change the displayed threshold curve shape.",
+            );
+        })
+        .on_select(move |cx, index| {
+            if index == 0 {
+                return;
+            }
 
-        cx.emit(CurvePresetEvent::Apply(index, path));
-    });
+            cx.emit(CurvePresetEvent::Apply(index, path));
+        });
+
+    CurvePresetButton::new(
+        cx,
+        CurvePresetButtonAction::SaveRequested,
+        path,
+        "Save",
+    )
+    .class("curve-preset-button");
+
+    CurvePresetButton::new(
+        cx,
+        CurvePresetButtonAction::DeleteSelected,
+        path,
+        "Del",
+    )
+    .disabled(can_delete_lens.map(|can_delete| !*can_delete))
+    .class("curve-preset-button");
 }
 
 fn prompt_for_curve_preset_path(dir: &Path) -> Option<PathBuf> {
