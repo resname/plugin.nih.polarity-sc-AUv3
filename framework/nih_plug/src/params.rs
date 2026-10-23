@@ -191,8 +191,11 @@ pub trait Param: Display + Debug + sealed::Sealed {
     fn as_ptr(&self) -> internals::ParamPtr;
 }
 
-/// Contains the setters for parameters. These should not be exposed to plugins to avoid confusion.
-pub(crate) trait ParamMut: Param {
+/// Contains the setters for parameters. These should not be used for automation purposes; the
+/// wrappers use these to forward host/editor changes to the parameters. Exposed publicly so
+/// plugins can drive parameter callbacks (e.g. to recompute compressor banks) from tests and
+/// custom editors.
+pub trait ParamMut: Param {
     /// Set this parameter based on a plain, unnormalized value. This does not snap to step sizes
     /// for continuous parameters (i.e. [`FloatParam`]). If
     /// [`modulate_value()`][Self::modulate_value()] has previously been called with a non zero

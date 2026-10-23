@@ -227,19 +227,26 @@ pub enum ThresholdMode {
 }
 
 impl ThresholdCurvePointParams {
-    fn new(index: usize, set_update_thresholds: Arc<dyn Fn(f32) + Send + Sync>) -> Self {
+    fn new(
+        name_prefix: &str,
+        index: usize,
+        set_update_thresholds: Arc<dyn Fn(f32) + Send + Sync>,
+    ) -> Self {
         let set_update_enabled = {
             let set_update_thresholds = set_update_thresholds.clone();
             Arc::new(move |_| set_update_thresholds(0.0))
         };
 
         Self {
-            enabled: BoolParam::new(format!("Curve Point {} Enabled", index + 1), false)
-                .with_callback(set_update_enabled)
-                .hide()
-                .hide_in_generic_ui(),
+            enabled: BoolParam::new(
+                format!("{name_prefix}Curve Point {} Enabled", index + 1),
+                false,
+            )
+            .with_callback(set_update_enabled)
+            .hide()
+            .hide_in_generic_ui(),
             frequency: FloatParam::new(
-                format!("Curve Point {} Frequency", index + 1),
+                format!("{name_prefix}Curve Point {} Frequency", index + 1),
                 1_000.0,
                 FloatRange::Skewed {
                     min: THRESHOLD_CURVE_MIN_FREQUENCY_HZ,
@@ -253,7 +260,7 @@ impl ThresholdCurvePointParams {
             .hide()
             .hide_in_generic_ui(),
             offset_db: FloatParam::new(
-                format!("Curve Point {} Offset", index + 1),
+                format!("{name_prefix}Curve Point {} Offset", index + 1),
                 0.0,
                 FloatRange::Linear {
                     min: -THRESHOLD_CURVE_POINT_OFFSET_LIMIT_DB,
@@ -273,6 +280,93 @@ impl ThresholdCurvePointParams {
             enabled: self.enabled.value(),
             frequency: self.frequency.value(),
             offset_db: self.offset_db.value(),
+        }
+    }
+}
+
+/// The parameters for a single compression path: the envelope follower timings plus that path's
+/// own threshold parameters.
+#[derive(Params)]
+pub struct CompressionPathParams {
+    /// The compressor's attack time in milliseconds.
+    #[id = "attack"]
+    pub compressor_attack_ms: FloatParam,
+    /// The compressor's release time in milliseconds.
+    #[id = "release"]
+    pub compressor_release_ms: FloatParam,
+    /// The threshold and curve parameters for this compression path.
+    #[nested(group = "threshold")]
+    pub threshold: ThresholdParams,
+}
+
+/// The downwards and upwards compression paths. Both paths get their own copy of every threshold
+/// parameter and their own envelope follower timings.
+#[derive(Params)]
+pub struct ThresholdPairParams {
+    #[nested(id_prefix = "downwards", group = "downwards")]
+    pub downwards: Arc<CompressionPathParams>,
+    #[nested(id_prefix = "upwards", group = "upwards")]
+    pub upwards: Arc<CompressionPathParams>,
+}
+
+impl CompressionPathParams {
+    /// Create parameters for a single compression path. `name_prefix` (e.g. `"Downwards"`) is
+    /// prepended to every parameter name. Changing the threshold parameters sets the passed
+    /// path's dirty flags, just like [`CompressorParams::new`] does.
+    pub fn new(
+        name_prefix: &str,
+        should_update_thresholds: Arc<AtomicBool>,
+        should_update_knee_parabolas: Arc<AtomicBool>,
+    ) -> Self {
+        CompressionPathParams {
+            compressor_attack_ms: FloatParam::new(
+                format!("{name_prefix} Attack"),
+                150.0,
+                FloatRange::Skewed {
+                    min: 0.0,
+                    max: 10_000.0,
+                    factor: FloatRange::skew_factor(-2.0),
+                },
+            )
+            .with_unit(" ms")
+            .with_step_size(0.1),
+            compressor_release_ms: FloatParam::new(
+                format!("{name_prefix} Release"),
+                300.0,
+                FloatRange::Skewed {
+                    min: 0.0,
+                    max: 10_000.0,
+                    factor: FloatRange::skew_factor(-2.0),
+                },
+            )
+            .with_unit(" ms")
+            .with_step_size(0.1),
+            threshold: ThresholdParams::new(
+                name_prefix,
+                should_update_thresholds,
+                should_update_knee_parabolas,
+            ),
+        }
+    }
+}
+
+impl ThresholdPairParams {
+    /// Create the downwards and upwards compression path parameters, linked to `compressor_bank`'s
+    /// per-path dirty flags.
+    pub fn new(compressor_bank: &CompressorBank) -> Self {
+        ThresholdPairParams {
+            downwards: Arc::new(CompressionPathParams::new(
+                DOWNWARDS_NAME_PREFIX,
+                compressor_bank.should_update_downwards_thresholds.clone(),
+                compressor_bank
+                    .should_update_downwards_knee_parabolas
+                    .clone(),
+            )),
+            upwards: Arc::new(CompressionPathParams::new(
+                UPWARDS_NAME_PREFIX,
+                compressor_bank.should_update_upwards_thresholds.clone(),
+                compressor_bank.should_update_upwards_knee_parabolas.clone(),
+            )),
         }
     }
 }
@@ -316,39 +410,37 @@ pub struct CompressorParams {
 }
 
 impl ThresholdParams {
-    /// Create a new [`ThresholdParams`] object. Changing any of the threshold parameters causes the
-    /// passed compressor bank's thresholds and knee parabolas to be updated.
-    pub fn new(compressor_bank: &CompressorBank) -> Self {
-        let should_update_downwards_thresholds =
-            compressor_bank.should_update_downwards_thresholds.clone();
-        let should_update_upwards_thresholds =
-            compressor_bank.should_update_upwards_thresholds.clone();
-        let should_update_downwards_knee_parabolas = compressor_bank
-            .should_update_downwards_knee_parabolas
-            .clone();
-        let should_update_upwards_knee_parabolas =
-            compressor_bank.should_update_upwards_knee_parabolas.clone();
-        let set_update_both_thresholds = Arc::new(move |_| {
-            should_update_downwards_thresholds.store(true, Ordering::Relaxed);
-            should_update_upwards_thresholds.store(true, Ordering::Relaxed);
-            should_update_downwards_knee_parabolas.store(true, Ordering::Relaxed);
-            should_update_upwards_knee_parabolas.store(true, Ordering::Relaxed);
+    /// Create a new [`ThresholdParams`] object for a single compression path. All parameter names
+    /// are prefixed with `name_prefix` (e.g. `"Downwards"`). Changing any of the threshold
+    /// parameters causes the passed atomics — the corresponding compression path's dirty flags in
+    /// the [`CompressorBank`] — to be updated.
+    pub fn new(
+        name_prefix: &str,
+        should_update_thresholds: Arc<AtomicBool>,
+        should_update_knee_parabolas: Arc<AtomicBool>,
+    ) -> Self {
+        let set_update_this_path = Arc::new({
+            let should_update_knee_parabolas = should_update_knee_parabolas.clone();
+            move |_| {
+                should_update_thresholds.store(true, Ordering::Relaxed);
+                should_update_knee_parabolas.store(true, Ordering::Relaxed);
+            }
         });
 
         ThresholdParams {
             threshold_db: FloatParam::new(
-                "Global Threshold",
+                format!("{name_prefix} Global Threshold"),
                 -12.0,
                 FloatRange::Linear {
                     min: -100.0,
                     max: 20.0,
                 },
             )
-            .with_callback(set_update_both_thresholds.clone())
+            .with_callback(set_update_this_path.clone())
             .with_unit(" dB")
             .with_step_size(0.1),
             center_frequency: FloatParam::new(
-                "Threshold Center",
+                format!("{name_prefix} Threshold Center"),
                 1_000.0,
                 FloatRange::Skewed {
                     min: 20.0,
@@ -356,14 +448,14 @@ impl ThresholdParams {
                     factor: FloatRange::skew_factor(-2.0),
                 },
             )
-            .with_callback(set_update_both_thresholds.clone())
+            .with_callback(set_update_this_path.clone())
             // This includes the unit
             .with_value_to_string(formatters::v2s_f32_hz_then_khz(0))
             .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
             // These are polynomial coefficients that are evaluated in the log/log domain
             // (octaves/decibels). The global threshold is the intercept.
             curve_slope: FloatParam::new(
-                "Threshold Slope",
+                format!("{name_prefix} Threshold Slope"),
                 0.0,
                 FloatRange::SymmetricalSkewed {
                     min: -36.0,
@@ -372,7 +464,7 @@ impl ThresholdParams {
                     center: 0.0,
                 },
             )
-            .with_callback(set_update_both_thresholds.clone())
+            .with_callback(set_update_this_path.clone())
             .with_value_to_string(Arc::new(|value| {
                 let display_value = threshold_slope_to_display_value(value);
                 if (display_value * 100.0).round() / 100.0 == 0.0 {
@@ -392,7 +484,7 @@ impl ThresholdParams {
             .with_unit(" dB/oct")
             .with_step_size(0.01),
             curve_curve: FloatParam::new(
-                "Threshold Curve",
+                format!("{name_prefix} Threshold Curve"),
                 0.0,
                 FloatRange::SymmetricalSkewed {
                     min: -24.0,
@@ -401,20 +493,24 @@ impl ThresholdParams {
                     center: 0.0,
                 },
             )
-            .with_callback(set_update_both_thresholds.clone())
+            .with_callback(set_update_this_path.clone())
             .with_unit(" dB/oct²")
             .with_step_size(0.01)
             .hide_in_generic_ui(),
             curve_points: std::array::from_fn(|index| {
-                ThresholdCurvePointParams::new(index, set_update_both_thresholds.clone())
+                ThresholdCurvePointParams::new(
+                    &format!("{name_prefix} "),
+                    index,
+                    set_update_this_path.clone(),
+                )
             }),
 
-            mode: EnumParam::new("Mode", ThresholdMode::Internal)
+            mode: EnumParam::new(format!("{name_prefix} Mode"), ThresholdMode::Internal)
                 // Not the most efficient way to do this, but it's a bit cleaner than the
                 // alternative
-                .with_callback(Arc::new(move |_| set_update_both_thresholds(0.0))),
+                .with_callback(Arc::new(move |_| set_update_this_path(0.0))),
             sc_channel_link: FloatParam::new(
-                "SC Channel Link",
+                format!("{name_prefix} SC Channel Link"),
                 0.8,
                 FloatRange::Linear { min: 0.0, max: 1.0 },
             )
@@ -422,7 +518,7 @@ impl ThresholdParams {
             .with_value_to_string(formatters::v2s_f32_percentage(0))
             .with_string_to_value(formatters::s2v_f32_percentage()),
             gain_smoothing: FloatParam::new(
-                "Smoothing",
+                format!("{name_prefix} Smoothing"),
                 0.0,
                 FloatRange::Linear { min: 0.0, max: 1.0 },
             )
@@ -865,7 +961,7 @@ impl CompressorBank {
         first_non_dc_bin: usize,
     ) {
         assert_eq!(buffer.len(), self.ln_freqs.len());
-        let mode = params.threshold.mode.value();
+        let mode = params.thresholds.downwards.threshold.mode.value();
         let freeze_enabled = params.global.compressor_freeze.value();
         let freeze_supported = matches!(
             mode,
@@ -953,7 +1049,7 @@ impl CompressorBank {
             let analyzer_input_data = self.analyzer_input_data.input_buffer();
 
             // The editor needs to know about this too so it can draw the spectra correctly
-            analyzer_input_data.curve_params = params.threshold.curve_params();
+            analyzer_input_data.curve_params = params.thresholds.downwards.threshold.curve_params();
             analyzer_input_data.curve_offsets_db = (
                 params.compressors.upwards.threshold_offset_db.value(),
                 params.compressors.downwards.threshold_offset_db.value(),
@@ -1022,9 +1118,11 @@ impl CompressorBank {
         // The timings are scaled by `self.envelope_followers_timing_scale` to allow the envelope
         // followers to settle in quicker after a reset
         let attack_ms =
-            params.global.compressor_attack_ms.value() * self.envelope_followers_timing_scale;
+            // FIXME(plan Task 2): per-path envelopes
+            params.thresholds.downwards.compressor_attack_ms.value() * self.envelope_followers_timing_scale;
         let release_ms =
-            params.global.compressor_release_ms.value() * self.envelope_followers_timing_scale;
+            // FIXME(plan Task 2): per-path envelopes
+            params.thresholds.downwards.compressor_release_ms.value() * self.envelope_followers_timing_scale;
 
         // This needs to gradually fade from 0.0 back to 1.0 after a reset
         if self.envelope_followers_timing_scale < 1.0 && channel_idx == self.envelopes.len() - 1 {
@@ -1082,9 +1180,11 @@ impl CompressorBank {
         // The timings are scaled by `self.envelope_followers_timing_scale` to allow the envelope
         // followers to settle in quicker after a reset
         let attack_ms =
-            params.global.compressor_attack_ms.value() * self.envelope_followers_timing_scale;
+            // FIXME(plan Task 2): per-path envelopes
+            params.thresholds.downwards.compressor_attack_ms.value() * self.envelope_followers_timing_scale;
         let release_ms =
-            params.global.compressor_release_ms.value() * self.envelope_followers_timing_scale;
+            // FIXME(plan Task 2): per-path envelopes
+            params.thresholds.downwards.compressor_release_ms.value() * self.envelope_followers_timing_scale;
 
         // This needs to gradually fade from 0.0 back to 1.0 after a reset
         if self.envelope_followers_timing_scale < 1.0 && channel_idx == self.envelopes.len() - 1 {
@@ -1110,7 +1210,13 @@ impl CompressorBank {
 
         // For the channel linking
         let num_channels = self.sidechain_spectrum_magnitudes.len() as f32;
-        let other_channels_t = params.threshold.sc_channel_link.value() / num_channels;
+        let other_channels_t = params
+            .thresholds
+            .downwards
+            .threshold
+            .sc_channel_link
+            .value()
+            / num_channels;
         let this_channel_t = 1.0 - (other_channels_t * (num_channels - 1.0));
 
         for (bin_idx, envelope) in self.envelopes[channel_idx].iter_mut().enumerate() {
@@ -1180,7 +1286,13 @@ impl CompressorBank {
         }
 
         let num_channels = self.sidechain_spectrum_magnitudes.len() as f32;
-        let other_channels_t = params.threshold.sc_channel_link.value() / num_channels;
+        let other_channels_t = params
+            .thresholds
+            .downwards
+            .threshold
+            .sc_channel_link
+            .value()
+            / num_channels;
         let this_channel_t = 1.0 - (other_channels_t * (num_channels - 1.0));
 
         self.match_curve_meter
@@ -1213,7 +1325,7 @@ impl CompressorBank {
         }
 
         let hop_frames = (self.window_size / overlap_times).max(1);
-        let threshold = &params.threshold;
+        let threshold = &params.thresholds.downwards.threshold;
         let fixed_slope = match threshold.mode.value() {
             ThresholdMode::Internal => internal_threshold_slope(threshold.curve_slope.value()),
             ThresholdMode::SidechainMatch | ThresholdMode::SidechainCompress => {
@@ -1328,7 +1440,7 @@ impl CompressorBank {
         }
 
         self.smooth_gain_differences(
-            params.threshold.gain_smoothing.value(),
+            params.thresholds.downwards.threshold.gain_smoothing.value(),
             first_non_dc_bin,
             buffer.len(),
         );
@@ -1362,7 +1474,13 @@ impl CompressorBank {
 
         // For the channel linking
         let num_channels = self.sidechain_spectrum_magnitudes.len() as f32;
-        let other_channels_t = params.threshold.sc_channel_link.value() / num_channels;
+        let other_channels_t = params
+            .thresholds
+            .downwards
+            .threshold
+            .sc_channel_link
+            .value()
+            / num_channels;
         let this_channel_t = 1.0 - (other_channels_t * (num_channels - 1.0));
 
         assert!(self.sidechain_spectrum_magnitudes[channel_idx].len() == buffer.len());
@@ -1466,7 +1584,7 @@ impl CompressorBank {
         }
 
         self.smooth_gain_differences(
-            params.threshold.gain_smoothing.value(),
+            params.thresholds.downwards.threshold.gain_smoothing.value(),
             first_non_dc_bin,
             buffer.len(),
         );
@@ -1606,7 +1724,7 @@ impl CompressorBank {
     /// are updated in accordance to the atomic flags set on this struct.
     fn update_if_needed(&mut self, params: &SpectralCompressorParams) {
         // The threshold curve is a polynomial in log-log (decibels-octaves) space
-        let curve_params = params.threshold.curve_params();
+        let curve_params = params.thresholds.downwards.threshold.curve_params();
         let curve = Curve::new(&curve_params);
 
         if self
@@ -1821,6 +1939,7 @@ fn upwards_soft_knee_coefficients(threshold_db: f32, knee_width_db: f32, ratio: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nih_plug::params::ParamMut;
     use nih_plug::prelude::{BufferConfig, ProcessMode};
     use triple_buffer::TripleBuffer;
 
@@ -1918,6 +2037,56 @@ mod tests {
             .expect("failed to spawn test thread")
             .join()
             .expect("test thread panicked");
+    }
+
+    #[test]
+    fn threshold_param_sets_only_its_own_flags() {
+        run_with_large_stack(|| {
+            let (bank, params, _ir) = make_bank_and_params(1, 64);
+
+            // Clear all six dirty flags
+            bank.should_update_downwards_thresholds
+                .store(false, Ordering::Relaxed);
+            bank.should_update_downwards_knee_parabolas
+                .store(false, Ordering::Relaxed);
+            bank.should_update_downwards_ratios
+                .store(false, Ordering::Relaxed);
+            bank.should_update_upwards_thresholds
+                .store(false, Ordering::Relaxed);
+            bank.should_update_upwards_knee_parabolas
+                .store(false, Ordering::Relaxed);
+            bank.should_update_upwards_ratios
+                .store(false, Ordering::Relaxed);
+
+            // Drive the downwards path's params through the param tree
+            params
+                .thresholds
+                .downwards
+                .threshold
+                .threshold_db
+                .set_plain_value(-13.0);
+            params
+                .compressors
+                .downwards
+                .threshold_offset_db
+                .set_plain_value(1.0);
+
+            assert!(bank
+                .should_update_downwards_thresholds
+                .load(Ordering::Relaxed));
+            assert!(bank
+                .should_update_downwards_knee_parabolas
+                .load(Ordering::Relaxed));
+            // Neither the threshold nor threshold-offset params touch ratios
+            assert!(!bank.should_update_downwards_ratios.load(Ordering::Relaxed));
+            assert!(!bank
+                .should_update_upwards_thresholds
+                .load(Ordering::Relaxed));
+            assert!(!bank
+                .should_update_upwards_knee_parabolas
+                .load(Ordering::Relaxed));
+            assert!(!bank.should_update_upwards_ratios.load(Ordering::Relaxed));
+        });
     }
 
     #[test]

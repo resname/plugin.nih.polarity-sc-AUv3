@@ -92,14 +92,14 @@ impl Analyzer {
         self.selected_point_index = Some(point_index);
         self.drag_active = true;
 
-        let point = &self.params.threshold.curve_points[point_index];
+        let point = &self.params.thresholds.downwards.threshold.curve_points[point_index];
         Self::emit_begin(cx, &point.frequency);
         Self::emit_begin(cx, &point.offset_db);
     }
 
     fn finish_drag(&mut self, cx: &mut EventContext) {
         if let Some(point_index) = self.selected_point_index {
-            let point = &self.params.threshold.curve_points[point_index];
+            let point = &self.params.thresholds.downwards.threshold.curve_points[point_index];
             Self::emit_end(cx, &point.frequency);
             Self::emit_end(cx, &point.offset_db);
         }
@@ -112,6 +112,8 @@ impl Analyzer {
 
     fn first_free_point_index(&self) -> Option<usize> {
         self.params
+            .thresholds
+            .downwards
             .threshold
             .curve_points
             .iter()
@@ -119,7 +121,7 @@ impl Analyzer {
     }
 
     fn set_point_enabled(&self, cx: &mut EventContext, point_index: usize, enabled: bool) {
-        let point = &self.params.threshold.curve_points[point_index];
+        let point = &self.params.thresholds.downwards.threshold.curve_points[point_index];
         Self::emit_begin(cx, &point.enabled);
         Self::emit_set(cx, &point.enabled, enabled);
         Self::emit_end(cx, &point.enabled);
@@ -132,7 +134,7 @@ impl Analyzer {
         frequency: f32,
         offset_db: f32,
     ) {
-        let point = &self.params.threshold.curve_points[point_index];
+        let point = &self.params.thresholds.downwards.threshold.curve_points[point_index];
         Self::emit_set(cx, &point.frequency, frequency);
         Self::emit_set(cx, &point.offset_db, offset_db);
     }
@@ -148,7 +150,7 @@ impl Analyzer {
             return None;
         }
 
-        let curve_params = self.params.threshold.curve_params();
+        let curve_params = self.params.thresholds.downwards.threshold.curve_params();
         let curve = Curve::new(&curve_params);
         let display_offset_db = self.editable_curve_display_offset_db();
         let hit_radius = scale_factor * 8.0;
@@ -197,7 +199,7 @@ impl Analyzer {
             THRESHOLD_CURVE_MAX_FREQUENCY_HZ,
         );
         let clicked_db = display_db_to_raw_db(unclamped_t_to_db(y_t), ln_freq);
-        let curve_params = self.params.threshold.curve_params();
+        let curve_params = self.params.thresholds.downwards.threshold.curve_params();
         let curve = Curve::new(&curve_params);
         let offset_db = (clicked_db
             - self.editable_curve_display_offset_db()

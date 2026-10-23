@@ -118,9 +118,10 @@ pub struct SpectralCompressorParams {
     #[nested(group = "global")]
     pub global: Arc<GlobalParams>,
 
-    /// Parameters controlling the compressor thresholds and curves.
-    #[nested(group = "threshold")]
-    pub threshold: Arc<compressor_bank::ThresholdParams>,
+    /// The downwards and upwards compression paths, each with its own threshold parameters and
+    /// envelope follower timings.
+    #[nested(group = "thresholds")]
+    pub thresholds: Arc<compressor_bank::ThresholdPairParams>,
     /// Parameters for the upwards and downwards compressors.
     #[nested(group = "compressors")]
     pub compressors: compressor_bank::CompressorBankParams,
@@ -148,14 +149,6 @@ pub struct GlobalParams {
     #[id = "stft_overlap"]
     pub overlap_times_order: IntParam,
 
-    /// The compressor's attack time in milliseconds. Controls both upwards and downwards
-    /// compression.
-    #[id = "attack"]
-    pub compressor_attack_ms: FloatParam,
-    /// The compressor's release time in milliseconds. Controls both upwards and downwards
-    /// compression.
-    #[id = "release"]
-    pub compressor_release_ms: FloatParam,
     /// Freeze the current per-bin gain curve and keep applying it until disabled.
     #[id = "compressor_freeze"]
     pub compressor_freeze: BoolParam,
@@ -267,28 +260,6 @@ impl Default for GlobalParams {
             .with_value_to_string(formatters::v2s_i32_power_of_two())
             .with_string_to_value(formatters::s2v_i32_power_of_two()),
 
-            compressor_attack_ms: FloatParam::new(
-                "Attack",
-                150.0,
-                FloatRange::Skewed {
-                    min: 0.0,
-                    max: 10_000.0,
-                    factor: FloatRange::skew_factor(-2.0),
-                },
-            )
-            .with_unit(" ms")
-            .with_step_size(0.1),
-            compressor_release_ms: FloatParam::new(
-                "Release",
-                300.0,
-                FloatRange::Skewed {
-                    min: 0.0,
-                    max: 10_000.0,
-                    factor: FloatRange::skew_factor(-2.0),
-                },
-            )
-            .with_unit(" ms")
-            .with_step_size(0.1),
             compressor_freeze: BoolParam::new("Freeze", false),
         }
     }
@@ -303,7 +274,7 @@ impl SpectralCompressorParams {
 
             global: Arc::new(GlobalParams::default()),
 
-            threshold: Arc::new(compressor_bank::ThresholdParams::new(compressor_bank)),
+            thresholds: Arc::new(compressor_bank::ThresholdPairParams::new(compressor_bank)),
             compressors: compressor_bank::CompressorBankParams::new(compressor_bank),
         }
     }
@@ -480,7 +451,7 @@ impl Plugin for SpectralCompressor {
                 first_non_dc_bin_idx,
             };
 
-            match self.params.threshold.mode.value() {
+            match self.params.thresholds.downwards.threshold.mode.value() {
                 compressor_bank::ThresholdMode::Internal => self.stft.process_overlap_add(
                     buffer,
                     overlap_times,

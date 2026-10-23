@@ -420,7 +420,7 @@ fn css_modified_at(css_path: &PathBuf) -> Option<SystemTime> {
 
 impl ExportUiModel {
     fn current_curve_preset(&self) -> CurvePreset {
-        let threshold = &self.params.threshold;
+        let threshold = &self.params.thresholds.downwards.threshold;
 
         CurvePreset {
             name: String::new(),
@@ -479,7 +479,7 @@ impl ExportUiModel {
 
     fn apply_curve_preset(&self, preset: CurvePreset, source: CurvePresetSource) {
         let setter = ParamSetter::new(self.gui_context.as_ref());
-        let threshold = &self.params.threshold;
+        let threshold = &self.params.thresholds.downwards.threshold;
 
         setter.begin_set_parameter(&threshold.threshold_db);
         setter.set_parameter(&threshold.threshold_db, preset.threshold_db);
@@ -516,7 +516,7 @@ impl ExportUiModel {
 
     fn apply_match_curve(&self, fit: MatchCurveFit) {
         let setter = ParamSetter::new(self.gui_context.as_ref());
-        let threshold = &self.params.threshold;
+        let threshold = &self.params.thresholds.downwards.threshold;
 
         setter.begin_set_parameter(&threshold.threshold_db);
         setter.set_parameter(&threshold.threshold_db, fit.intercept);
@@ -543,7 +543,7 @@ impl ExportUiModel {
 
     fn clear_match_curve(&self) {
         let setter = ParamSetter::new(self.gui_context.as_ref());
-        let threshold = &self.params.threshold;
+        let threshold = &self.params.thresholds.downwards.threshold;
 
         setter.begin_set_parameter(&threshold.threshold_db);
         setter.set_parameter(&threshold.threshold_db, -12.0);
@@ -739,7 +739,7 @@ fn global_column(cx: &mut Context) {
             .class("row");
         } else if name == "Window Overlap" {
             // Rendered together with Window Size above.
-        } else if name == "Output Gain" || name == "Mix" || name == "Attack" || name == "Release" {
+        } else if name == "Output Gain" || name == "Mix" {
             HStack::new(cx, |cx| {
                 Label::new(cx, name).class("label");
                 GenericUi::draw_widget(cx, global_params, param_ptr);
@@ -763,46 +763,51 @@ fn global_column(cx: &mut Context) {
     });
 }
 
-/// Renders threshold parameters.
+/// Renders threshold parameters. Transitional until Task 7 switches the editor to the tabbed
+/// per-path layout: this shows the downwards path's parameters only.
 fn threshold_column(cx: &mut Context) {
-    let threshold_params = Data::params.map(|p| p.threshold.clone());
+    let threshold_params = Data::params.map(|p| p.thresholds.downwards.clone());
     let global_params = Data::params.map(|p| p.global.clone());
     let mut curve_controls_drawn = false;
 
     GenericUi::new_custom(cx, threshold_params, |cx, param_ptr| {
         let name = unsafe { param_ptr.name() };
 
-        if name == "Threshold Center" {
+        if name == "Downwards Threshold Center" {
             HStack::new(cx, |cx| {
                 Label::new(cx, "Threshold").class("label");
                 HStack::new(cx, |cx| {
-                    ParamSlider::new(cx, threshold_params, |params| &params.center_frequency)
-                        .class("threshold-slider")
-                        .tooltip(|cx| {
-                            Label::new(
-                                cx,
-                                "Threshold center is the frequency where the global threshold value is anchored.",
-                            );
-                        });
-                    ParamSlider::new(cx, threshold_params, |params| &params.curve_slope)
-                        .class("threshold-slider")
-                        .tooltip(|cx| {
-                            Label::new(
-                                cx,
-                                "Threshold slope tilts the threshold curve across octaves. In Pink Noise mode, 3 dB/oct is the neutral default.",
-                            );
-                        });
+                    ParamSlider::new(cx, threshold_params, |params| {
+                        &params.threshold.center_frequency
+                    })
+                    .class("threshold-slider")
+                    .tooltip(|cx| {
+                        Label::new(
+                            cx,
+                            "Threshold center is the frequency where the global threshold value is anchored.",
+                        );
+                    });
+                    ParamSlider::new(cx, threshold_params, |params| {
+                        &params.threshold.curve_slope
+                    })
+                    .class("threshold-slider")
+                    .tooltip(|cx| {
+                        Label::new(
+                            cx,
+                            "Threshold slope tilts the threshold curve across octaves. In Pink Noise mode, 3 dB/oct is the neutral default.",
+                        );
+                    });
                 })
                 .class("threshold-slider-group");
             })
             .class("row");
-        } else if name == "Threshold Slope" {
+        } else if name == "Downwards Threshold Slope" {
             // Rendered together with Threshold Center above.
         } else {
             HStack::new(cx, |cx| {
                 Label::new(cx, name).class("label");
 
-                if name == "Mode" {
+                if name == "Downwards Mode" {
                     mode_picklist(cx);
                 } else {
                     GenericUi::draw_widget(cx, threshold_params, param_ptr);
@@ -811,7 +816,7 @@ fn threshold_column(cx: &mut Context) {
             .class("row");
         }
 
-        if !curve_controls_drawn && name == "Threshold Slope" {
+        if !curve_controls_drawn && name == "Downwards Threshold Slope" {
             curve_controls_drawn = true;
             HStack::new(cx, |cx| {
                 Label::new(cx, "Curve Matching").class("label");
@@ -958,18 +963,31 @@ fn mode_picklist(cx: &mut Context) {
     PickList::new(
         cx,
         Data::mode_options,
-        Data::params.map(|p| p.threshold.mode.value().to_index()),
+        Data::params.map(|p| p.thresholds.downwards.threshold.mode.value().to_index()),
         true,
     )
     .class("mode-picklist")
     .on_select(move |cx, index| {
-        if params.threshold.mode.value().to_index() == index {
+        if params
+            .thresholds
+            .downwards
+            .threshold
+            .mode
+            .value()
+            .to_index()
+            == index
+        {
             return;
         }
 
         let new_mode = ThresholdMode::from_index(index);
-        let mode_param = params.threshold.mode.as_ptr();
-        let normalized = params.threshold.mode.preview_normalized(new_mode);
+        let mode_param = params.thresholds.downwards.threshold.mode.as_ptr();
+        let normalized = params
+            .thresholds
+            .downwards
+            .threshold
+            .mode
+            .preview_normalized(new_mode);
 
         cx.emit(RawParamEvent::BeginSetParameter(mode_param));
         cx.emit(RawParamEvent::SetParameterNormalized(
