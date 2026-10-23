@@ -88,7 +88,9 @@
 .globals-bar {
   width: 1s;
   height: auto;
-  col-between: 10px;
+  /* Tight spacing: the bar's five sliders + two 88px buttons barely fit
+     inside the 680px main column. */
+  col-between: 8px;
   left: 10px;
   right: 10px;
   top: 4px;
@@ -101,7 +103,7 @@
 }
 
 .bar-slider {
-  width: 90px;
+  width: 74px;
 }
 
 .page-stack {
@@ -207,9 +209,11 @@
   col-between: 4px;
 }
 
+/* The picker buttons of the analyzer's compression curve row: text
+   "Downwards"/"Upwards" needs more room than a bare 88px. */
 .threshold-curve-button-down,
 .threshold-curve-button-up {
-  width: 88px;
+  width: 104px;
   background-color: #3a3a3a;
 }
 
@@ -225,11 +229,23 @@
   color: #1f1f1f;
 }
 
+ /* The curve picker row above the analyzer; the 1s spacers center the
+   caption + buttons pair. */
 .curve-edit-row {
   size: auto;
   col-between: 8px;
   left: 2px;
   top: 10px;
+}
+
+.curve-edit-row-spacer {
+  width: 1s;
+}
+
+.curve-edit-button-group {
+  width: 212px;
+  height: auto;
+  col-between: 4px;
 }
 
 .curve-edit-caption {

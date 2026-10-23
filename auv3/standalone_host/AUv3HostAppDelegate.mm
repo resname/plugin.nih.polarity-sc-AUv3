@@ -460,6 +460,20 @@ static MIDIPortRef sMIDIInputPort = 0;
     }
     else
     {
+      // Ask for the permission so the system prompt appears deterministically on
+      // first launch instead of relying on incidental triggers; the answer only
+      // applies from the next launch.
+      if ([AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio] ==
+          AVAuthorizationStatusNotDetermined)
+      {
+        [AVCaptureDevice
+            requestAccessForMediaType:AVMediaTypeAudio
+                    completionHandler:^(BOOL granted) {
+                      std::cout << "[auv3-standalone] microphone permission "
+                                << (granted ? "granted" : "denied")
+                                << " (applies from the next launch)" << std::endl;
+                    }];
+      }
       std::cout << "[auv3-standalone] WARNING: microphone access not granted — "
                    "running with silent input"
                 << std::endl;
@@ -479,28 +493,25 @@ static MIDIPortRef sMIDIInputPort = 0;
   {
     if (inputUsable)
     {
-      // Effect: input -> AU -> output
+      // Effect: input -> mixer -> AU -> output
       AVAudioNode *input = _engine.inputNode;
-      AVAudioFormat *inputFormat = [input outputFormatForBus:0];
-      // Built-in mono microphones supply a 1-channel format, but the AU's
-      // input buses only accept their exact declared channel counts
-      // (shouldChangeToFormat rejects anything else with
-      // kAudioUnitErr_FormatNotSupported -10868). Request the AU's channel
-      // count at the hardware sample rate; AVAudioEngine inserts the channel
-      // converter for us.
-      AVAudioChannelCount auChannels =
-          [_avAudioUnit.AUAudioUnit.inputBusses count] > 0
-              ? [[_avAudioUnit.AUAudioUnit.inputBusses objectAtIndexedSubscript:0].format
-                    channelCount]
-              : 0;
-      if (auChannels != 0 && inputFormat.channelCount != auChannels)
-      {
-        std::cout << "[auv3-standalone] connecting HW input (" << inputFormat.channelCount
-                  << " ch) through " << auChannels << " ch converter for the AU" << std::endl;
-        inputFormat = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:inputFormat.sampleRate
-                                                                     channels:auChannels];
-      }
-      [_engine connect:input to:_avAudioUnit format:inputFormat];
+      // Passing nil keeps the HW node's native input format (mono on the
+      // built-in microphone): forcing the AU's channel count directly onto
+      // the connection makes AVAudioEngine try to set the input node's own
+      // output bus to that count, which it rejects with
+      // kAudioUnitErr_FormatNotSupported (-10868). The mixer in between is
+      // the component that does the mono -> multi-channel conversion (and
+      // sample-rate conversion) for the AU's declared input format.
+      AVAudioMixerNode *micMixer = [[AVAudioMixerNode alloc] init];
+      [_engine attachNode:micMixer];
+      [_engine connect:input to:micMixer format:nil];
+      AVAudioFormat *auInputFormat =
+          _avAudioUnit.AUAudioUnit.inputBusses.count > 0
+              ? [_avAudioUnit.AUAudioUnit.inputBusses objectAtIndexedSubscript:0].format
+              : nil;
+      std::cout << "[auv3-standalone] connecting HW input (" << [input outputFormatForBus:0].channelCount
+                << " ch) through mixer to AU (" << auInputFormat.channelCount << " ch)" << std::endl;
+      [_engine connect:micMixer to:_avAudioUnit format:auInputFormat];
     }
     [_engine connect:_avAudioUnit to:output format:outputFormat];
   }
@@ -510,7 +521,14 @@ static MIDIPortRef sMIDIInputPort = 0;
               << std::endl;
     NSAlert *alert = [[NSAlert alloc] init];
     [alert setMessageText:@"Failed to set up audio engine"];
-    [alert setInformativeText:e.reason ?: @"Invalid audio graph configuration"];
+    [alert setInformativeText:[NSString
+                                  stringWithFormat:@"%@\n(input permission: %@)",
+                                  e.reason ?: @"Invalid audio graph configuration",
+                                  [AVCaptureDevice authorizationStatusForMediaType:
+                                                        AVMediaTypeAudio] ==
+                                          AVAuthorizationStatusAuthorized
+                                      ? @"granted"
+                                      : @"not granted"]];
     [alert addButtonWithTitle:@"OK"];
     [alert runModal];
     return;

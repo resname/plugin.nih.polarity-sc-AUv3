@@ -769,7 +769,7 @@ fn globals_bar(cx: &mut Context) {
         .class("globals-bar-group");
 
         HStack::new(cx, |cx| {
-            Label::new(cx, "FFT Window").class("label");
+            Label::new(cx, "FFT").class("label");
             HStack::new(cx, |cx| {
                 ParamSlider::new(cx, global_params, |params| &params.window_size_order)
                     .set_style(ParamSliderStyle::FromLeft)
@@ -1025,8 +1025,9 @@ fn path_column(cx: &mut Context, path: CompressionPath) {
 fn analyzer_column(cx: &mut Context) {
     VStack::new(cx, |cx| {
         // The curve picker sits directly above the analyzer: the analyzer shows and
-        // edits the curve points of the selected path.
+        // edits the curve points of the selected path. Centered with 1s spacers.
         HStack::new(cx, |cx| {
+            Element::new(cx).class("curve-edit-row-spacer");
             Label::new(cx, "Edit compression curve:").class("curve-edit-caption");
             HStack::new(cx, |cx| {
                 SelectStateButton::new(
@@ -1044,7 +1045,8 @@ fn analyzer_column(cx: &mut Context) {
                     "threshold-curve-button-up",
                 );
             })
-            .class("curve-matching-button-group");
+            .class("curve-edit-button-group");
+            Element::new(cx).class("curve-edit-row-spacer");
         })
         .class("curve-edit-row");
         Analyzer::new(
