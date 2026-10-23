@@ -483,36 +483,104 @@ static MIDIPortRef sMIDIInputPort = 0;
   _engine = [[AVAudioEngine alloc] init];
   [_engine attachNode:_avAudioUnit];
 
-  AVAudioNode *output = _engine.outputNode;
-  AVAudioFormat *outputFormat = [output inputFormatForBus:0];
-
   // AVAudioEngine throws NSException (-> abort) on invalid graph
   // configurations instead of returning NSErrors. Convert that into a
-  // visible alert instead of a crash report.
+  // visible alert instead of a crash report. Each candidate graph gets its
+  // own attempt so the log tells which connection failed and the next
+  // fallback can run.
   @try
   {
+    BOOL inputConnected = NO;
     if (inputUsable)
     {
-      // Effect: input -> mixer -> AU -> output
       AVAudioNode *input = _engine.inputNode;
-      // Passing nil keeps the HW node's native input format (mono on the
-      // built-in microphone): forcing the AU's channel count directly onto
-      // the connection makes AVAudioEngine try to set the input node's own
-      // output bus to that count, which it rejects with
-      // kAudioUnitErr_FormatNotSupported (-10868). The mixer in between is
-      // the component that does the mono -> multi-channel conversion (and
-      // sample-rate conversion) for the AU's declared input format.
-      AVAudioMixerNode *micMixer = [[AVAudioMixerNode alloc] init];
-      [_engine attachNode:micMixer];
-      [_engine connect:input to:micMixer format:nil];
+      AVAudioFormat *hwFormat = [input outputFormatForBus:0];
       AVAudioFormat *auInputFormat =
           _avAudioUnit.AUAudioUnit.inputBusses.count > 0
               ? [_avAudioUnit.AUAudioUnit.inputBusses objectAtIndexedSubscript:0].format
               : nil;
-      std::cout << "[auv3-standalone] connecting HW input (" << [input outputFormatForBus:0].channelCount
-                << " ch) through mixer to AU (" << auInputFormat.channelCount << " ch)" << std::endl;
-      [_engine connect:micMixer to:_avAudioUnit format:auInputFormat];
+      std::cout << "[auv3-standalone] HW input " << hwFormat.sampleRate << " Hz / "
+                << hwFormat.channelCount << " ch; AU input " << auInputFormat.sampleRate
+                << " Hz / " << auInputFormat.channelCount << " ch" << std::endl;
+
+      // First choice: input -> mixer -> AU. nil keeps the HW node's native
+      // format on the hardware side (forcing a channel count here rejects
+      // with -10868) and the mixer performs the mono -> multichannel
+      // conversion to the AU's declared input format.
+      @try
+      {
+        AVAudioMixerNode *micMixer = [[AVAudioMixerNode alloc] init];
+        [_engine attachNode:micMixer];
+        [_engine connect:input to:micMixer format:nil];
+        [_engine connect:micMixer to:_avAudioUnit format:auInputFormat];
+        inputConnected = YES;
+        std::cout << "[auv3-standalone] input graph: input -> mixer -> AU" << std::endl;
+      }
+      @catch (NSException *e)
+      {
+        std::cout << "[auv3-standalone] mixer path failed: " << [e.reason UTF8String] << std::endl;
+      }
+
+      if (!inputConnected)
+      {
+        // Retry on a fresh engine with no explicit formats at all; both
+        // connections then resolve their formats from the nodes themselves.
+        @try
+        {
+          _engine = [[AVAudioEngine alloc] init];
+          [_engine attachNode:_avAudioUnit];
+          AVAudioMixerNode *micMixer = [[AVAudioMixerNode alloc] init];
+          [_engine attachNode:micMixer];
+          [_engine connect:_engine.inputNode to:micMixer format:nil];
+          [_engine connect:micMixer to:_avAudioUnit format:nil];
+          inputConnected = YES;
+          std::cout << "[auv3-standalone] input graph: input -> mixer -> AU (nil formats)"
+                    << std::endl;
+        }
+        @catch (NSException *e)
+        {
+          std::cout << "[auv3-standalone] nil-format mixer path also failed: "
+                    << [e.reason UTF8String] << std::endl;
+        }
+      }
+
+      if (!inputConnected)
+      {
+        // Direct input -> AU connection. Works when the hardware format
+        // matches the AU's declaration (e.g. a stereo interface).
+        @try
+        {
+          _engine = [[AVAudioEngine alloc] init];
+          [_engine attachNode:_avAudioUnit];
+          [_engine connect:_engine.inputNode to:_avAudioUnit format:auInputFormat];
+          inputConnected = YES;
+          std::cout << "[auv3-standalone] input graph: input -> AU (direct)" << std::endl;
+        }
+        @catch (NSException *e)
+        {
+          std::cout << "[auv3-standalone] direct input path also failed: "
+                    << [e.reason UTF8String] << std::endl;
+        }
+      }
     }
+
+    if (!inputConnected)
+    {
+      if (inputUsable)
+      {
+        std::cout << "[auv3-standalone] WARNING: falling back to silent input" << std::endl;
+      }
+      // A running engine (even without input) keeps the AU's extension
+      // process awake; with no engine at all macOS suspends the appex and
+      // its remote GUI stops responding to clicks.
+      _engine = [[AVAudioEngine alloc] init];
+      [_engine attachNode:_avAudioUnit];
+    }
+
+    // After the fallbacks the engine may have been rebuilt, so fetch the
+    // output node and its format here.
+    AVAudioNode *output = _engine.outputNode;
+    AVAudioFormat *outputFormat = [output inputFormatForBus:0];
     [_engine connect:_avAudioUnit to:output format:outputFormat];
   }
   @catch (NSException *e)
