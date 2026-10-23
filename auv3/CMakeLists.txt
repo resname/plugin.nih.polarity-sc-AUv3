@@ -53,6 +53,11 @@ if (APPLE)
             # changes.
             PREFERRED_GUI_SIZE "1360x690"
             MACOS_EMBEDDED_CLAP_LOCATION "${POLARITY_CLAP_LOCATION}"
+            # Sandboxed appex + outbound access for the GUI's update check:
+            # without com.apple.security.network.client every connection dies
+            # in the sandbox and the update-available strip never shows. See
+            # resname.entitlements.
+            ENTITLEMENTS "${CMAKE_CURRENT_SOURCE_DIR}/resname.entitlements"
     )
     add_executable(polarity_sc_dark_as_auv3_standalone)
     target_add_auv3_standalone_wrapper(

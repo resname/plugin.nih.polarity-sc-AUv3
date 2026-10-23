@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Per-plugin entitlements for the AUv3 wrapper (passed to
+         target_add_auv3_wrapper via ENTITLEMENTS). Base set matches the
+         wrapper's shared default: the app sandbox is required for the appex
+         to register as an Audio Unit on macOS, and user-selected file access
+         covers preset import/export dialogs. This plugin additionally runs an
+         update check (ureq GET against api.github.com when the GUI opens), so
+         the sandbox profile needs outbound network access; without this
+         entitlement every connection fails and the update strip never shows. -->
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+    <key>com.apple.security.network.client</key>
+    <true/>
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+</dict>
+</plist>
