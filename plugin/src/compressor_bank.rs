@@ -54,6 +54,69 @@ const HIGH_FREQ_RATIO_ROLLOFF_FREQUENCY_LN: f32 = 10.001068; // 22_050.0f32.ln()
 /// configured timingsafter the compressor bank has been reset.
 const ENVELOPE_FOLLOWER_TIMING_FADE_MS: f32 = 150.0;
 
+/// One of the two compression paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Path {
+    Downwards,
+    Upwards,
+}
+
+/// The state for a single compression path: per-bin compressor parameters. Every field is sized to
+/// match the current complex FFT buffer.
+pub(crate) struct PathState {
+    /// Per-bin compressor thresholds, in decibels.
+    pub(crate) thresholds_db: Vec<f32>,
+    /// The ratios for the compressors. At 1.0 the compressors won't do anything.
+    pub(crate) ratios: Vec<f32>,
+    /// The knee is modelled as a parabola using the formula `x + a * (x + b)^2`. This is `a` in
+    /// that equation. The formula is taken from the Digital Dynamic Range Compressor Design paper
+    /// by Dimitrios Giannoulis et. al.
+    pub(crate) knee_parabola_scale: Vec<f32>,
+    /// `b` in the equation from `knee_parabola_scale`.
+    pub(crate) knee_parabola_intercept: Vec<f32>,
+}
+
+impl PathState {
+    fn new() -> Self {
+        Self {
+            thresholds_db: Vec::new(),
+            ratios: Vec::new(),
+            knee_parabola_scale: Vec::new(),
+            knee_parabola_intercept: Vec::new(),
+        }
+    }
+
+    fn reserve_complex_len(&mut self, complex_buffer_len: usize) {
+        self.thresholds_db
+            .reserve_exact(complex_buffer_len.saturating_sub(self.thresholds_db.len()));
+        self.ratios
+            .reserve_exact(complex_buffer_len.saturating_sub(self.ratios.len()));
+        self.knee_parabola_scale
+            .reserve_exact(complex_buffer_len.saturating_sub(self.knee_parabola_scale.len()));
+        self.knee_parabola_intercept
+            .reserve_exact(complex_buffer_len.saturating_sub(self.knee_parabola_intercept.len()));
+    }
+
+    fn resize_complex_len(&mut self, complex_buffer_len: usize) {
+        self.thresholds_db.resize(complex_buffer_len, 1.0);
+        self.ratios.resize(complex_buffer_len, 1.0);
+        self.knee_parabola_scale.resize(complex_buffer_len, 1.0);
+        self.knee_parabola_intercept.resize(complex_buffer_len, 1.0);
+    }
+}
+
+/// One entry per compression path in `update_if_needed()`: the path selector, that path's dirty
+/// flags, its parameter sets, and the knee coefficient function.
+type PathUpdate = (
+    Path,
+    Arc<AtomicBool>,
+    Arc<AtomicBool>,
+    Arc<AtomicBool>,
+    Arc<CompressionPathParams>,
+    Arc<CompressorParams>,
+    fn(f32, f32, f32) -> (f32, f32),
+);
+
 /// A bank of compressors so each FFT bin can be compressed individually. The vectors in this struct
 /// will have a capacity of `MAX_WINDOW_SIZE / 2 + 1` and a size that matches the current complex
 /// FFT buffer size. This is stored as a struct of arrays to make SIMD-ing easier in the future.
@@ -79,27 +142,10 @@ pub struct CompressorBank {
     /// compressor. This is precomputed since all update functions need it.
     ln_freqs: Vec<f32>,
 
-    /// Downwards compressor thresholds, in decibels.
-    downwards_thresholds_db: Vec<f32>,
-    /// The ratios for the the downwards compressors. At 1.0 the compressors won't do anything. If
-    /// [`CompressorBankParams::high_freq_ratio_rolloff`] is set to 1.0, then this will be the same
-    /// for each compressor.
-    downwards_ratios: Vec<f32>,
-    /// The knee is modelled as a parabola using the formula `x + a * (x + b)^2`. This is `a` in
-    /// that equation. The formula is taken from the Digital Dynamic Range Compressor Design paper
-    /// by Dimitrios Giannoulis et. al.
-    downwards_knee_parabola_scale: Vec<f32>,
-    /// `b` in the equation from `downwards_knee_parabola_scale`.
-    downwards_knee_parabola_intercept: Vec<f32>,
-
-    /// Upwards compressor thresholds, in decibels.
-    upwards_thresholds_db: Vec<f32>,
-    /// The same as `downwards_ratios`, but for the upwards compression.
-    upwards_ratios: Vec<f32>,
-    /// `downwards_knee_parabola_scale`, but for the upwards compressors.
-    upwards_knee_parabola_scale: Vec<f32>,
-    /// `downwards_knee_parabola_intercept`, but for the upwards compressors.
-    upwards_knee_parabola_intercept: Vec<f32>,
+    /// The per-path compressor state. Each compression path has its own per-bin thresholds,
+    /// ratios and soft knee parabolas.
+    pub(crate) downwards: PathState,
+    pub(crate) upwards: PathState,
 
     /// The current envelope value for this bin, in linear space. Indexed by
     /// `[channel_idx][compressor_idx]`.
@@ -720,15 +766,8 @@ impl CompressorBank {
 
             ln_freqs: Vec::with_capacity(complex_buffer_len),
 
-            downwards_thresholds_db: Vec::with_capacity(complex_buffer_len),
-            downwards_ratios: Vec::with_capacity(complex_buffer_len),
-            downwards_knee_parabola_scale: Vec::with_capacity(complex_buffer_len),
-            downwards_knee_parabola_intercept: Vec::with_capacity(complex_buffer_len),
-
-            upwards_thresholds_db: Vec::with_capacity(complex_buffer_len),
-            upwards_ratios: Vec::with_capacity(complex_buffer_len),
-            upwards_knee_parabola_scale: Vec::with_capacity(complex_buffer_len),
-            upwards_knee_parabola_intercept: Vec::with_capacity(complex_buffer_len),
+            downwards: PathState::new(),
+            upwards: PathState::new(),
 
             envelopes: vec![Vec::with_capacity(complex_buffer_len); num_channels],
             envelope_followers_timing_scale: 0.0,
@@ -766,27 +805,8 @@ impl CompressorBank {
         self.ln_freqs
             .reserve_exact(complex_buffer_len.saturating_sub(self.ln_freqs.len()));
 
-        self.downwards_thresholds_db
-            .reserve_exact(complex_buffer_len.saturating_sub(self.downwards_thresholds_db.len()));
-        self.downwards_ratios
-            .reserve_exact(complex_buffer_len.saturating_sub(self.downwards_ratios.len()));
-        self.downwards_knee_parabola_scale.reserve_exact(
-            complex_buffer_len.saturating_sub(self.downwards_knee_parabola_scale.len()),
-        );
-        self.downwards_knee_parabola_intercept.reserve_exact(
-            complex_buffer_len.saturating_sub(self.downwards_knee_parabola_intercept.len()),
-        );
-
-        self.upwards_thresholds_db
-            .reserve_exact(complex_buffer_len.saturating_sub(self.upwards_thresholds_db.len()));
-        self.upwards_ratios
-            .reserve_exact(complex_buffer_len.saturating_sub(self.upwards_ratios.len()));
-        self.upwards_knee_parabola_scale.reserve_exact(
-            complex_buffer_len.saturating_sub(self.upwards_knee_parabola_scale.len()),
-        );
-        self.upwards_knee_parabola_intercept.reserve_exact(
-            complex_buffer_len.saturating_sub(self.upwards_knee_parabola_intercept.len()),
-        );
+        self.downwards.reserve_complex_len(complex_buffer_len);
+        self.upwards.reserve_complex_len(complex_buffer_len);
 
         self.envelopes.resize_with(num_channels, Vec::new);
         for envelopes in self.envelopes.iter_mut() {
@@ -835,19 +855,8 @@ impl CompressorBank {
             *ln_freq = freq.ln();
         }
 
-        self.downwards_thresholds_db.resize(complex_buffer_len, 1.0);
-        self.downwards_ratios.resize(complex_buffer_len, 1.0);
-        self.downwards_knee_parabola_scale
-            .resize(complex_buffer_len, 1.0);
-        self.downwards_knee_parabola_intercept
-            .resize(complex_buffer_len, 1.0);
-
-        self.upwards_thresholds_db.resize(complex_buffer_len, 1.0);
-        self.upwards_ratios.resize(complex_buffer_len, 1.0);
-        self.upwards_knee_parabola_scale
-            .resize(complex_buffer_len, 1.0);
-        self.upwards_knee_parabola_intercept
-            .resize(complex_buffer_len, 1.0);
+        self.downwards.resize_complex_len(complex_buffer_len);
+        self.upwards.resize_complex_len(complex_buffer_len);
 
         for envelopes in self.envelopes.iter_mut() {
             envelopes.resize(complex_buffer_len, ENVELOPE_INIT_VALUE);
@@ -1363,14 +1372,14 @@ impl CompressorBank {
         let upwards_knee_width_db = params.compressors.upwards.knee_width_db.value();
         let upwards_max_gain_change_db = params.compressors.upwards.max_gain_change_db.value();
 
-        assert!(self.downwards_thresholds_db.len() == buffer.len());
-        assert!(self.downwards_ratios.len() == buffer.len());
-        assert!(self.downwards_knee_parabola_scale.len() == buffer.len());
-        assert!(self.downwards_knee_parabola_intercept.len() == buffer.len());
-        assert!(self.upwards_thresholds_db.len() == buffer.len());
-        assert!(self.upwards_ratios.len() == buffer.len());
-        assert!(self.upwards_knee_parabola_scale.len() == buffer.len());
-        assert!(self.upwards_knee_parabola_intercept.len() == buffer.len());
+        assert!(self.downwards.thresholds_db.len() == buffer.len());
+        assert!(self.downwards.ratios.len() == buffer.len());
+        assert!(self.downwards.knee_parabola_scale.len() == buffer.len());
+        assert!(self.downwards.knee_parabola_intercept.len() == buffer.len());
+        assert!(self.upwards.thresholds_db.len() == buffer.len());
+        assert!(self.upwards.ratios.len() == buffer.len());
+        assert!(self.upwards.knee_parabola_scale.len() == buffer.len());
+        assert!(self.upwards.knee_parabola_intercept.len() == buffer.len());
         assert!(self.frozen_gain_difference_db[channel_idx].len() == buffer.len());
         assert!(self.raw_gain_difference_db.len() == buffer.len());
         assert!(self.smoothed_gain_difference_db.len() == buffer.len());
@@ -1390,11 +1399,11 @@ impl CompressorBank {
             // `bin` by the gain difference
             let envelope_db = util::gain_to_db_fast_epsilon(*envelope);
 
-            let downwards_threshold_db = &self.downwards_thresholds_db[bin_idx];
-            let downwards_ratio = &self.downwards_ratios[bin_idx];
-            let downwards_knee_parabola_scale = &self.downwards_knee_parabola_scale[bin_idx];
+            let downwards_threshold_db = &self.downwards.thresholds_db[bin_idx];
+            let downwards_ratio = &self.downwards.ratios[bin_idx];
+            let downwards_knee_parabola_scale = &self.downwards.knee_parabola_scale[bin_idx];
             let downwards_knee_parabola_intercept =
-                &self.downwards_knee_parabola_intercept[bin_idx];
+                &self.downwards.knee_parabola_intercept[bin_idx];
             let downwards_compressed = compress_downwards(
                 envelope_db,
                 *downwards_threshold_db,
@@ -1406,10 +1415,10 @@ impl CompressorBank {
 
             // Upwards compression should not happen when the signal is _too_ quiet as we'd only be
             // amplifying noise. We also don't want to amplify DC noise and super low frequencies.
-            let upwards_threshold_db = &self.upwards_thresholds_db[bin_idx];
-            let upwards_ratio = &self.upwards_ratios[bin_idx];
-            let upwards_knee_parabola_scale = &self.upwards_knee_parabola_scale[bin_idx];
-            let upwards_knee_parabola_intercept = &self.upwards_knee_parabola_intercept[bin_idx];
+            let upwards_threshold_db = &self.upwards.thresholds_db[bin_idx];
+            let upwards_ratio = &self.upwards.ratios[bin_idx];
+            let upwards_knee_parabola_scale = &self.upwards.knee_parabola_scale[bin_idx];
+            let upwards_knee_parabola_intercept = &self.upwards.knee_parabola_intercept[bin_idx];
             let upwards_compressed = if bin_idx >= first_non_dc_bin
                 && *upwards_ratio != 1.0
                 && envelope_db > util::MINUS_INFINITY_DB
@@ -1484,10 +1493,10 @@ impl CompressorBank {
         let this_channel_t = 1.0 - (other_channels_t * (num_channels - 1.0));
 
         assert!(self.sidechain_spectrum_magnitudes[channel_idx].len() == buffer.len());
-        assert!(self.downwards_thresholds_db.len() == buffer.len());
-        assert!(self.downwards_ratios.len() == buffer.len());
-        assert!(self.upwards_thresholds_db.len() == buffer.len());
-        assert!(self.upwards_ratios.len() == buffer.len());
+        assert!(self.downwards.thresholds_db.len() == buffer.len());
+        assert!(self.downwards.ratios.len() == buffer.len());
+        assert!(self.upwards.thresholds_db.len() == buffer.len());
+        assert!(self.upwards.ratios.len() == buffer.len());
         assert!(self.frozen_gain_difference_db[channel_idx].len() == buffer.len());
         assert!(self.linked_sidechain_magnitudes.len() == buffer.len());
         assert!(self.raw_gain_difference_db.len() == buffer.len());
@@ -1529,10 +1538,10 @@ impl CompressorBank {
             let sidechain_scale_db = util::gain_to_db_fast_epsilon(sidechain_scale);
 
             // Notice how the threshold and knee values are scaled here
-            let downwards_threshold_db = (self.downwards_thresholds_db[bin_idx]
+            let downwards_threshold_db = (self.downwards.thresholds_db[bin_idx]
                 + sidechain_scale_db)
                 .max(util::MINUS_INFINITY_DB);
-            let downwards_ratio = &self.downwards_ratios[bin_idx];
+            let downwards_ratio = &self.downwards.ratios[bin_idx];
             // Because the thresholds are scaled based on the sidechain input, we also need to
             // recompute the knee coefficients
             let (downwards_knee_parabola_scale, downwards_knee_parabola_intercept) =
@@ -1550,9 +1559,9 @@ impl CompressorBank {
                 downwards_knee_parabola_intercept,
             );
 
-            let upwards_threshold_db = (self.upwards_thresholds_db[bin_idx] + sidechain_scale_db)
+            let upwards_threshold_db = (self.upwards.thresholds_db[bin_idx] + sidechain_scale_db)
                 .max(util::MINUS_INFINITY_DB);
-            let upwards_ratio = &self.upwards_ratios[bin_idx];
+            let upwards_ratio = &self.upwards.ratios[bin_idx];
             let upwards_compressed = if bin_idx >= first_non_dc_bin
                 && *upwards_ratio != 1.0
                 && envelope_db > util::MINUS_INFINITY_DB
@@ -1721,131 +1730,124 @@ impl CompressorBank {
     }
 
     /// Update the compressors if needed. This is called just before processing, and the compressors
-    /// are updated in accordance to the atomic flags set on this struct.
+    /// are updated in accordance to the atomic flags set on this struct. Each compression path
+    /// recomputes its state from its own parameters and its own dirty flags; a change to one
+    /// path's parameters only touches that path.
     fn update_if_needed(&mut self, params: &SpectralCompressorParams) {
-        // The threshold curve is a polynomial in log-log (decibels-octaves) space
-        let curve_params = params.thresholds.downwards.threshold.curve_params();
-        let curve = Curve::new(&curve_params);
+        // Owned clones of the dirty flags and parameter arcs so the per-path mutable state can be
+        // borrowed below without holding a borrow of `self`
+        let paths: [PathUpdate; 2] = [
+            (
+                Path::Downwards,
+                self.should_update_downwards_thresholds.clone(),
+                self.should_update_downwards_ratios.clone(),
+                self.should_update_downwards_knee_parabolas.clone(),
+                params.thresholds.downwards.clone(),
+                params.compressors.downwards.clone(),
+                downwards_soft_knee_coefficients,
+            ),
+            (
+                Path::Upwards,
+                self.should_update_upwards_thresholds.clone(),
+                self.should_update_upwards_ratios.clone(),
+                self.should_update_upwards_knee_parabolas.clone(),
+                params.thresholds.upwards.clone(),
+                params.compressors.upwards.clone(),
+                upwards_soft_knee_coefficients,
+            ),
+        ];
 
-        if self
-            .should_update_downwards_thresholds
-            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+        for (
+            path,
+            should_update_thresholds,
+            should_update_ratios,
+            should_update_knee_parabolas,
+            path_params,
+            compressor_params,
+            knee_coefficients_fn,
+        ) in paths
         {
-            let downwards_intercept = params.compressors.downwards.threshold_offset_db.value();
-            for (ln_freq, threshold_db) in self
-                .ln_freqs
-                .iter()
-                .zip(self.downwards_thresholds_db.iter_mut())
+            // Borrowed directly (not via `path_state()`) so the borrow checker can see the
+            // disjoint field borrows of `self` below
+            let path_state = match path {
+                Path::Downwards => &mut self.downwards,
+                Path::Upwards => &mut self.upwards,
+            };
+
+            if should_update_thresholds
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
             {
-                *threshold_db = curve.evaluate_ln(*ln_freq) + downwards_intercept;
+                // The threshold curve is a polynomial in log-log (decibels-octaves) space
+                let curve_params = path_params.threshold.curve_params();
+                let curve = Curve::new(&curve_params);
+                let intercept = compressor_params.threshold_offset_db.value();
+                for (ln_freq, threshold_db) in self
+                    .ln_freqs
+                    .iter()
+                    .zip(path_state.thresholds_db.iter_mut())
+                {
+                    *threshold_db = curve.evaluate_ln(*ln_freq) + intercept;
+                }
             }
-        }
 
-        if self
-            .should_update_upwards_thresholds
-            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            let upwards_intercept = params.compressors.upwards.threshold_offset_db.value();
-            for (ln_freq, threshold_db) in self
-                .ln_freqs
-                .iter()
-                .zip(self.upwards_thresholds_db.iter_mut())
+            if should_update_ratios
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
             {
-                *threshold_db = curve.evaluate_ln(*ln_freq) + upwards_intercept;
+                // If the high-frequency rolloff is enabled then higher frequency bins will have
+                // their ratios reduced to reduce harshness. This follows the octave scale. It's
+                // easier to do this cleanly using reciprocals.
+                let target_ratio_recip = compressor_params.ratio.value().recip();
+                let high_freq_ratio_rolloff = compressor_params.high_freq_ratio_rolloff.value();
+                for (ln_freq, ratio) in self.ln_freqs.iter().zip(path_state.ratios.iter_mut()) {
+                    // Clamp to avoid negative low-frequency values in edge cases.
+                    let octave_fraction = (ln_freq / HIGH_FREQ_RATIO_ROLLOFF_FREQUENCY_LN).max(0.0);
+                    let rolloff_t = octave_fraction * high_freq_ratio_rolloff;
+
+                    // If the octave fraction times the rolloff amount is high, then this should get
+                    // closer to `high_freq_ratio_rolloff` (which is in [0, 1]).
+                    let ratio_recip = (target_ratio_recip * (1.0 - rolloff_t)) + rolloff_t;
+                    *ratio = ratio_recip.recip();
+                }
             }
-        }
 
-        if self
-            .should_update_downwards_ratios
-            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            // If the high-frequency rolloff is enabled then higher frequency bins will have their
-            // ratios reduced to reduce harshness. This follows the octave scale. It's easier to do
-            // this cleanly using reciprocals.
-            let target_ratio_recip = params.compressors.downwards.ratio.value().recip();
-            let downwards_high_freq_ratio_rolloff =
-                params.compressors.downwards.high_freq_ratio_rolloff.value();
-            for (ln_freq, ratio) in self.ln_freqs.iter().zip(self.downwards_ratios.iter_mut()) {
-                // Clamp to avoid negative low-frequency values in edge cases.
-                let octave_fraction = (ln_freq / HIGH_FREQ_RATIO_ROLLOFF_FREQUENCY_LN).max(0.0);
-                let rolloff_t = octave_fraction * downwards_high_freq_ratio_rolloff;
-
-                // If the octave fraction times the rolloff amount is high, then this should get
-                // closer to `high_freq_ratio_rolloff` (which is in [0, 1]).
-                let ratio_recip = (target_ratio_recip * (1.0 - rolloff_t)) + rolloff_t;
-                *ratio = ratio_recip.recip();
-            }
-        }
-
-        if self
-            .should_update_upwards_ratios
-            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            let target_ratio_recip = params.compressors.upwards.ratio.value().recip();
-            let upwards_high_freq_ratio_rolloff =
-                params.compressors.upwards.high_freq_ratio_rolloff.value();
-            for (ln_freq, ratio) in self.ln_freqs.iter().zip(self.upwards_ratios.iter_mut()) {
-                // Clamp to avoid negative low-frequency values in edge cases.
-                let octave_fraction = (ln_freq / HIGH_FREQ_RATIO_ROLLOFF_FREQUENCY_LN).max(0.0);
-                let rolloff_t = octave_fraction * upwards_high_freq_ratio_rolloff;
-
-                let ratio_recip = (target_ratio_recip * (1.0 - rolloff_t)) + rolloff_t;
-                *ratio = ratio_recip.recip();
-            }
-        }
-
-        if self
-            .should_update_downwards_knee_parabolas
-            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            let downwards_knee_width_db = params.compressors.downwards.knee_width_db.value();
-            for ((ratio, threshold_db), (knee_parabola_scale, knee_parambola_intercept)) in self
-                .downwards_ratios
-                .iter()
-                .zip(self.downwards_thresholds_db.iter())
-                .zip(
-                    self.downwards_knee_parabola_scale
-                        .iter_mut()
-                        .zip(self.downwards_knee_parabola_intercept.iter_mut()),
-                )
+            if should_update_knee_parabolas
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
             {
-                // This is the formula from the Digital Dynamic Range Compressor Design paper by
-                // Dimitrios Giannoulis et. al. These are `a` and `b` from the `x + a * (x + b)^2`
-                // respectively used to compute the soft knee respectively.
-                (*knee_parabola_scale, *knee_parambola_intercept) =
-                    downwards_soft_knee_coefficients(
-                        *threshold_db,
-                        downwards_knee_width_db,
-                        *ratio,
-                    );
+                let knee_width_db = compressor_params.knee_width_db.value();
+                for ((ratio, threshold_db), (knee_parabola_scale, knee_parambola_intercept)) in
+                    path_state
+                        .ratios
+                        .iter()
+                        .zip(path_state.thresholds_db.iter())
+                        .zip(
+                            path_state
+                                .knee_parabola_scale
+                                .iter_mut()
+                                .zip(path_state.knee_parabola_intercept.iter_mut()),
+                        )
+                {
+                    // This is the formula from the Digital Dynamic Range Compressor Design paper
+                    // by Dimitrios Giannoulis et. al. These are `a` and `b` from the
+                    // `x + a * (x + b)^2` respectively used to compute the soft knee respectively.
+                    // The upwards version is slightly different, hence the function pointer.
+                    (*knee_parabola_scale, *knee_parambola_intercept) =
+                        knee_coefficients_fn(*threshold_db, knee_width_db, *ratio);
+                }
             }
         }
+    }
 
-        if self
-            .should_update_upwards_knee_parabolas
-            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            let upwards_knee_width_db = params.compressors.upwards.knee_width_db.value();
-            for ((ratio, threshold_db), (knee_parabola_scale, knee_parambola_intercept)) in self
-                .upwards_ratios
-                .iter()
-                .zip(self.upwards_thresholds_db.iter())
-                .zip(
-                    self.upwards_knee_parabola_scale
-                        .iter_mut()
-                        .zip(self.upwards_knee_parabola_intercept.iter_mut()),
-                )
-            {
-                // The upwards version is slightly different
-                (*knee_parabola_scale, *knee_parambola_intercept) =
-                    upwards_soft_knee_coefficients(*threshold_db, upwards_knee_width_db, *ratio);
-            }
+    /// Get the mutable per-bin state for a single compression path.
+    // Will be used by the per-path envelope and gain processing from Task 3 onward
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn path_state(&mut self, path: Path) -> &mut PathState {
+        match path {
+            Path::Downwards => &mut self.downwards,
+            Path::Upwards => &mut self.upwards,
         }
     }
 }
@@ -1991,18 +1993,20 @@ mod tests {
         let (knee_scale, knee_intercept) =
             downwards_soft_knee_coefficients(threshold_db, knee_width_db, ratio);
 
-        compressor_bank.downwards_thresholds_db.fill(threshold_db);
-        compressor_bank.downwards_ratios.fill(ratio);
+        compressor_bank.downwards.thresholds_db.fill(threshold_db);
+        compressor_bank.downwards.ratios.fill(ratio);
         compressor_bank
-            .downwards_knee_parabola_scale
+            .downwards
+            .knee_parabola_scale
             .fill(knee_scale);
         compressor_bank
-            .downwards_knee_parabola_intercept
+            .downwards
+            .knee_parabola_intercept
             .fill(knee_intercept);
-        compressor_bank.upwards_thresholds_db.fill(0.0);
-        compressor_bank.upwards_ratios.fill(1.0);
-        compressor_bank.upwards_knee_parabola_scale.fill(0.0);
-        compressor_bank.upwards_knee_parabola_intercept.fill(0.0);
+        compressor_bank.upwards.thresholds_db.fill(0.0);
+        compressor_bank.upwards.ratios.fill(1.0);
+        compressor_bank.upwards.knee_parabola_scale.fill(0.0);
+        compressor_bank.upwards.knee_parabola_intercept.fill(0.0);
     }
 
     fn make_complex_buffer(scale: f32, len: usize) -> Vec<Complex32> {
@@ -2037,6 +2041,57 @@ mod tests {
             .expect("failed to spawn test thread")
             .join()
             .expect("test thread panicked");
+    }
+
+    #[test]
+    fn update_if_needed_touches_only_flagged_path() {
+        run_with_large_stack(|| {
+            let (mut bank, params, _ir) = make_bank_and_params(1, 64);
+            bank.upwards.thresholds_db.fill(1234.0);
+
+            // Clear all six dirty flags
+            bank.should_update_downwards_thresholds
+                .store(false, Ordering::Relaxed);
+            bank.should_update_downwards_knee_parabolas
+                .store(false, Ordering::Relaxed);
+            bank.should_update_downwards_ratios
+                .store(false, Ordering::Relaxed);
+            bank.should_update_upwards_thresholds
+                .store(false, Ordering::Relaxed);
+            bank.should_update_upwards_knee_parabolas
+                .store(false, Ordering::Relaxed);
+            bank.should_update_upwards_ratios
+                .store(false, Ordering::Relaxed);
+
+            // Drive the downwards path's threshold params (this sets the downwards thresholds
+            // and knee parabola flags via the params' callbacks). The slope is set so it decodes
+            // to a flat curve in Internal mode (stored value 3 decodes to 0 dB/oct).
+            params
+                .thresholds
+                .downwards
+                .threshold
+                .threshold_db
+                .set_plain_value(-24.0);
+            params
+                .thresholds
+                .downwards
+                .threshold
+                .curve_slope
+                .set_plain_value(3.0);
+            params
+                .compressors
+                .downwards
+                .threshold_offset_db
+                .set_plain_value(0.0);
+            // Isolate the threshold update
+            bank.should_update_downwards_knee_parabolas
+                .store(false, Ordering::Relaxed);
+
+            bank.update_if_needed(&params);
+
+            assert!(bank.downwards.thresholds_db.iter().all(|t| *t == -24.0));
+            assert!(bank.upwards.thresholds_db.iter().all(|t| *t == 1234.0));
+        });
     }
 
     #[test]
@@ -2165,11 +2220,12 @@ mod tests {
         let (mut compressor_bank, params, _frozen_ir_output_data) = make_bank_and_params(1, 128);
         // Strong upwards compression: threshold -24 dBFS, 4:1 ratio, 6 dB knee
         let (knee_scale, knee_intercept) = upwards_soft_knee_coefficients(-24.0, 6.0, 4.0);
-        compressor_bank.upwards_thresholds_db.fill(-24.0);
-        compressor_bank.upwards_ratios.fill(4.0);
-        compressor_bank.upwards_knee_parabola_scale.fill(knee_scale);
+        compressor_bank.upwards.thresholds_db.fill(-24.0);
+        compressor_bank.upwards.ratios.fill(4.0);
+        compressor_bank.upwards.knee_parabola_scale.fill(knee_scale);
         compressor_bank
-            .upwards_knee_parabola_intercept
+            .upwards
+            .knee_parabola_intercept
             .fill(knee_intercept);
         configure_test_downwards_compression(&mut compressor_bank, 0.0, 1.0, 0.0);
 
