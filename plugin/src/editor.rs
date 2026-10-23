@@ -969,13 +969,13 @@ fn path_column(cx: &mut Context, path: CompressionPath) {
                 HStack::new(cx, |cx| {
                     Label::new(cx, "Curve Matching").class("label");
                     HStack::new(cx, |cx| {
-                        let match_curve_runtime_lens = match path {
-                            CompressionPath::Downwards => Data::match_curve_runtime_downwards,
-                            CompressionPath::Upwards => Data::match_curve_runtime_upwards,
+                        let match_curve_runtime = match path {
+                            CompressionPath::Downwards => Data::match_curve_runtime_downwards.get(cx),
+                            CompressionPath::Upwards => Data::match_curve_runtime_upwards.get(cx),
                         };
                         MatchCurveButton::new(
                             cx,
-                            match_curve_runtime_lens,
+                            match_curve_runtime,
                             Data::delta_active,
                             global_params,
                             path,

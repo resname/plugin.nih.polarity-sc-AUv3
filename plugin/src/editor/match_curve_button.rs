@@ -63,22 +63,21 @@ impl View for ClearCurveButton {
 }
 
 impl MatchCurveButton {
-    pub fn new<LMatch, LDelta, LGlobal, T>(
+    pub fn new<LDelta, LGlobal, T>(
         cx: &mut Context,
-        match_curve_lens: LMatch,
+        match_curve_runtime: Arc<MatchCurveRuntime>,
         delta_lens: LDelta,
         global_params: LGlobal,
         path: CompressionPath,
         label: impl Res<T> + Clone,
     ) -> Handle<'_, Self>
     where
-        LMatch: Lens<Target = Arc<MatchCurveRuntime>>,
         LDelta: Lens<Target = Arc<AtomicBool>>,
         LGlobal: Lens<Target = Arc<GlobalParams>> + Clone,
         T: ToString,
     {
         Self {
-            match_curve_runtime: match_curve_lens.get(cx),
+            match_curve_runtime,
             delta_active: delta_lens.get(cx),
             bypass_param: ParamWidgetBase::new(cx, global_params, |params| &params.bypass),
             path,
