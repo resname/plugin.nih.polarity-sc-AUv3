@@ -1032,20 +1032,9 @@ impl CompressorBank {
             self.match_curve_meter.start(self.sample_rate);
         }
 
-        // The match curve keeps a single (transitional) source: the main input unless some path
-        // follows the sidechain for its envelopes, in which case that's the measured signal
-        // (Task 5 re-homes the convention)
-        let sidechain_envelopes_used = [&params.thresholds.downwards, &params.thresholds.upwards]
-            .iter()
-            .any(|path_params| {
-                path_params.threshold.mode.value() == ThresholdMode::SidechainCompress
-            });
-        if sidechain_envelopes_used {
-            // This mode measures the sidechain signal instead
-            self.measure_match_curve_sidechain(channel_idx, params, overlap_times)
-        } else {
-            self.measure_match_curve_complex(buffer, channel_idx, params, overlap_times)
-        };
+        // The match curve meters the sidechain spectrum when any path is in a sidechain mode,
+        // and the main input otherwise (the singular `measure_match_curve()` picks the source)
+        self.measure_match_curve(buffer, channel_idx, params, overlap_times);
 
         // Each path follows its own envelope with its own attack and release times, from the
         // source its own mode dictates. The timing scale is advanced once per channel pass after
@@ -1308,9 +1297,12 @@ impl CompressorBank {
         }
     }
 
-    fn measure_match_curve_complex(
+    /// Meter the audio signal for the curve matching. Per the spec the source is the sidechain
+    /// spectrum when any path is in a sidechain mode, and the main input otherwise; the linked
+    //  magnitudes then use the first sidechain path's channel link, with downwards preferred.
+    fn measure_match_curve(
         &mut self,
-        buffer: &[Complex32],
+        main_buffer: &[Complex32],
         channel_idx: usize,
         params: &SpectralCompressorParams,
         overlap_times: usize,
@@ -1319,47 +1311,41 @@ impl CompressorBank {
             return;
         }
 
-        self.match_curve_meter
-            .measure_magnitudes(buffer.iter().map(|bin| bin.norm()));
-        self.finish_match_curve_channel_if_needed(channel_idx, params, overlap_times);
-    }
+        let first_sidechain_link = [&params.thresholds.downwards, &params.thresholds.upwards]
+            .iter()
+            .find(|path_params| {
+                !matches!(path_params.threshold.mode.value(), ThresholdMode::Internal)
+            })
+            .map(|path_params| path_params.threshold.sc_channel_link.value());
 
-    fn measure_match_curve_sidechain(
-        &mut self,
-        channel_idx: usize,
-        params: &SpectralCompressorParams,
-        overlap_times: usize,
-    ) {
-        if !self.match_curve_meter.is_active() {
-            return;
+        match first_sidechain_link {
+            Some(link_amount) => {
+                let num_channels = self.sidechain_spectrum_magnitudes.len() as f32;
+                let other_channels_t = link_amount / num_channels;
+                let this_channel_t = 1.0 - (other_channels_t * (num_channels - 1.0));
+
+                self.match_curve_meter
+                    .measure_magnitudes((0..self.ln_freqs.len()).map(|bin_idx| {
+                        self.sidechain_spectrum_magnitudes
+                            .iter()
+                            .enumerate()
+                            .map(|(sidechain_channel_idx, magnitudes)| {
+                                let t = if sidechain_channel_idx == channel_idx {
+                                    this_channel_t
+                                } else {
+                                    other_channels_t
+                                };
+
+                                magnitudes[bin_idx] * t
+                            })
+                            .sum::<f32>()
+                    }));
+            }
+            None => {
+                self.match_curve_meter
+                    .measure_magnitudes(main_buffer.iter().map(|bin| bin.norm()));
+            }
         }
-
-        let num_channels = self.sidechain_spectrum_magnitudes.len() as f32;
-        let other_channels_t = params
-            .thresholds
-            .downwards
-            .threshold
-            .sc_channel_link
-            .value()
-            / num_channels;
-        let this_channel_t = 1.0 - (other_channels_t * (num_channels - 1.0));
-
-        self.match_curve_meter
-            .measure_magnitudes((0..self.ln_freqs.len()).map(|bin_idx| {
-                self.sidechain_spectrum_magnitudes
-                    .iter()
-                    .enumerate()
-                    .map(|(sidechain_channel_idx, magnitudes)| {
-                        let t = if sidechain_channel_idx == channel_idx {
-                            this_channel_t
-                        } else {
-                            other_channels_t
-                        };
-
-                        magnitudes[bin_idx] * t
-                    })
-                    .sum::<f32>()
-            }));
         self.finish_match_curve_channel_if_needed(channel_idx, params, overlap_times);
     }
 
@@ -1964,6 +1950,7 @@ fn upwards_soft_knee_coefficients(threshold_db: f32, knee_width_db: f32, ratio: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::match_curve::MatchCurveResult;
     use nih_plug::params::ParamMut;
     use nih_plug::prelude::{BufferConfig, ProcessMode};
     use triple_buffer::TripleBuffer;
@@ -3030,6 +3017,48 @@ mod tests {
 
             let snapshot = frozen_ir_output_data.read().clone();
             assert!(!snapshot.valid);
+        });
+    }
+
+    #[test]
+    fn fixed_slope_uses_downwards_path_convention() {
+        run_with_large_stack(|| {
+            let window_size = 64;
+            let (mut bank, params, _ir) = make_bank_and_params(1, window_size);
+            let num_bins = window_size / 2 + 1;
+
+            // Both paths are Internal with a stored slope of 0, so each decodes its slope as
+            // 0 - 3 = -3 dB/oct (pink noise). The metering convention is downwards-first, so the
+            // published fit must carry the downwards path's decoded slope.
+            params
+                .thresholds
+                .downwards
+                .threshold
+                .curve_slope
+                .set_plain_value(0.0);
+            params
+                .thresholds
+                .upwards
+                .threshold
+                .curve_slope
+                .set_plain_value(0.0);
+
+            let buffer = make_complex_buffer(1.0, num_bins);
+            bank.match_curve_meter.start(48_000.0);
+            // The meter needs 5 seconds of hop-sized frames to finish: drive it well past that
+            let passes = 60_000 + 1;
+            for _ in 0..passes {
+                bank.measure_match_curve(&buffer, 0, &params, 4);
+            }
+
+            let result = bank
+                .match_curve_runtime
+                .take_finished_result()
+                .expect("match curve meter did not finish");
+            match result {
+                MatchCurveResult::Matched(fit) => assert_eq!(fit.slope, -3.0),
+                MatchCurveResult::Failed => panic!("fitting failed"),
+            }
         });
     }
 }

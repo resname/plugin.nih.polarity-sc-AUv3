@@ -479,100 +479,115 @@ impl ExportUiModel {
 
     fn apply_curve_preset(&self, preset: CurvePreset, source: CurvePresetSource) {
         let setter = ParamSetter::new(self.gui_context.as_ref());
-        let threshold = &self.params.thresholds.downwards.threshold;
 
-        setter.begin_set_parameter(&threshold.threshold_db);
-        setter.set_parameter(&threshold.threshold_db, preset.threshold_db);
-        setter.end_set_parameter(&threshold.threshold_db);
+        // The curve is shared between both paths, so a preset writes both curves identically
+        for threshold in [
+            &self.params.thresholds.downwards.threshold,
+            &self.params.thresholds.upwards.threshold,
+        ] {
+            setter.begin_set_parameter(&threshold.threshold_db);
+            setter.set_parameter(&threshold.threshold_db, preset.threshold_db);
+            setter.end_set_parameter(&threshold.threshold_db);
 
-        if source.applies_anchor_parameters() {
-            setter.begin_set_parameter(&threshold.center_frequency);
-            setter.set_parameter(&threshold.center_frequency, preset.center_frequency);
-            setter.end_set_parameter(&threshold.center_frequency);
+            if source.applies_anchor_parameters() {
+                setter.begin_set_parameter(&threshold.center_frequency);
+                setter.set_parameter(&threshold.center_frequency, preset.center_frequency);
+                setter.end_set_parameter(&threshold.center_frequency);
 
-            setter.begin_set_parameter(&threshold.curve_slope);
-            setter.set_parameter(&threshold.curve_slope, preset.curve_slope);
-            setter.end_set_parameter(&threshold.curve_slope);
-        }
+                setter.begin_set_parameter(&threshold.curve_slope);
+                setter.set_parameter(&threshold.curve_slope, preset.curve_slope);
+                setter.end_set_parameter(&threshold.curve_slope);
+            }
 
-        setter.begin_set_parameter(&threshold.curve_curve);
-        setter.set_parameter(&threshold.curve_curve, preset.curve_curve);
-        setter.end_set_parameter(&threshold.curve_curve);
+            setter.begin_set_parameter(&threshold.curve_curve);
+            setter.set_parameter(&threshold.curve_curve, preset.curve_curve);
+            setter.end_set_parameter(&threshold.curve_curve);
 
-        for (point_params, point) in threshold.curve_points.iter().zip(preset.points) {
-            setter.begin_set_parameter(&point_params.enabled);
-            setter.set_parameter(&point_params.enabled, point.enabled);
-            setter.end_set_parameter(&point_params.enabled);
+            for (point_params, point) in threshold.curve_points.iter().zip(preset.points) {
+                setter.begin_set_parameter(&point_params.enabled);
+                setter.set_parameter(&point_params.enabled, point.enabled);
+                setter.end_set_parameter(&point_params.enabled);
 
-            setter.begin_set_parameter(&point_params.frequency);
-            setter.set_parameter(&point_params.frequency, point.frequency);
-            setter.end_set_parameter(&point_params.frequency);
+                setter.begin_set_parameter(&point_params.frequency);
+                setter.set_parameter(&point_params.frequency, point.frequency);
+                setter.end_set_parameter(&point_params.frequency);
 
-            setter.begin_set_parameter(&point_params.offset_db);
-            setter.set_parameter(&point_params.offset_db, point.offset_db);
-            setter.end_set_parameter(&point_params.offset_db);
+                setter.begin_set_parameter(&point_params.offset_db);
+                setter.set_parameter(&point_params.offset_db, point.offset_db);
+                setter.end_set_parameter(&point_params.offset_db);
+            }
         }
     }
 
     fn apply_match_curve(&self, fit: MatchCurveFit) {
         let setter = ParamSetter::new(self.gui_context.as_ref());
-        let threshold = &self.params.thresholds.downwards.threshold;
 
-        setter.begin_set_parameter(&threshold.threshold_db);
-        setter.set_parameter(&threshold.threshold_db, fit.intercept);
-        setter.end_set_parameter(&threshold.threshold_db);
+        // The matching fit is a single spectrum, so it is written to both paths verbatim
+        for threshold in [
+            &self.params.thresholds.downwards.threshold,
+            &self.params.thresholds.upwards.threshold,
+        ] {
+            setter.begin_set_parameter(&threshold.threshold_db);
+            setter.set_parameter(&threshold.threshold_db, fit.intercept);
+            setter.end_set_parameter(&threshold.threshold_db);
 
-        setter.begin_set_parameter(&threshold.curve_curve);
-        setter.set_parameter(&threshold.curve_curve, fit.curve);
-        setter.end_set_parameter(&threshold.curve_curve);
+            setter.begin_set_parameter(&threshold.curve_curve);
+            setter.set_parameter(&threshold.curve_curve, fit.curve);
+            setter.end_set_parameter(&threshold.curve_curve);
 
-        for (point_params, point) in threshold.curve_points.iter().zip(fit.points) {
-            setter.begin_set_parameter(&point_params.enabled);
-            setter.set_parameter(&point_params.enabled, point.enabled);
-            setter.end_set_parameter(&point_params.enabled);
+            for (point_params, point) in threshold.curve_points.iter().zip(fit.points) {
+                setter.begin_set_parameter(&point_params.enabled);
+                setter.set_parameter(&point_params.enabled, point.enabled);
+                setter.end_set_parameter(&point_params.enabled);
 
-            setter.begin_set_parameter(&point_params.frequency);
-            setter.set_parameter(&point_params.frequency, point.frequency);
-            setter.end_set_parameter(&point_params.frequency);
+                setter.begin_set_parameter(&point_params.frequency);
+                setter.set_parameter(&point_params.frequency, point.frequency);
+                setter.end_set_parameter(&point_params.frequency);
 
-            setter.begin_set_parameter(&point_params.offset_db);
-            setter.set_parameter(&point_params.offset_db, point.offset_db);
-            setter.end_set_parameter(&point_params.offset_db);
+                setter.begin_set_parameter(&point_params.offset_db);
+                setter.set_parameter(&point_params.offset_db, point.offset_db);
+                setter.end_set_parameter(&point_params.offset_db);
+            }
         }
     }
 
     fn clear_match_curve(&self) {
         let setter = ParamSetter::new(self.gui_context.as_ref());
-        let threshold = &self.params.thresholds.downwards.threshold;
 
-        setter.begin_set_parameter(&threshold.threshold_db);
-        setter.set_parameter(&threshold.threshold_db, -12.0);
-        setter.end_set_parameter(&threshold.threshold_db);
+        // Clearing resets both paths' curves
+        for threshold in [
+            &self.params.thresholds.downwards.threshold,
+            &self.params.thresholds.upwards.threshold,
+        ] {
+            setter.begin_set_parameter(&threshold.threshold_db);
+            setter.set_parameter(&threshold.threshold_db, -12.0);
+            setter.end_set_parameter(&threshold.threshold_db);
 
-        setter.begin_set_parameter(&threshold.center_frequency);
-        setter.set_parameter(&threshold.center_frequency, 1_000.0);
-        setter.end_set_parameter(&threshold.center_frequency);
+            setter.begin_set_parameter(&threshold.center_frequency);
+            setter.set_parameter(&threshold.center_frequency, 1_000.0);
+            setter.end_set_parameter(&threshold.center_frequency);
 
-        setter.begin_set_parameter(&threshold.curve_slope);
-        setter.set_parameter(&threshold.curve_slope, 0.0);
-        setter.end_set_parameter(&threshold.curve_slope);
+            setter.begin_set_parameter(&threshold.curve_slope);
+            setter.set_parameter(&threshold.curve_slope, 0.0);
+            setter.end_set_parameter(&threshold.curve_slope);
 
-        setter.begin_set_parameter(&threshold.curve_curve);
-        setter.set_parameter(&threshold.curve_curve, 0.0);
-        setter.end_set_parameter(&threshold.curve_curve);
+            setter.begin_set_parameter(&threshold.curve_curve);
+            setter.set_parameter(&threshold.curve_curve, 0.0);
+            setter.end_set_parameter(&threshold.curve_curve);
 
-        for point_params in &threshold.curve_points {
-            setter.begin_set_parameter(&point_params.enabled);
-            setter.set_parameter(&point_params.enabled, false);
-            setter.end_set_parameter(&point_params.enabled);
+            for point_params in &threshold.curve_points {
+                setter.begin_set_parameter(&point_params.enabled);
+                setter.set_parameter(&point_params.enabled, false);
+                setter.end_set_parameter(&point_params.enabled);
 
-            setter.begin_set_parameter(&point_params.frequency);
-            setter.set_parameter(&point_params.frequency, 1_000.0);
-            setter.end_set_parameter(&point_params.frequency);
+                setter.begin_set_parameter(&point_params.frequency);
+                setter.set_parameter(&point_params.frequency, 1_000.0);
+                setter.end_set_parameter(&point_params.frequency);
 
-            setter.begin_set_parameter(&point_params.offset_db);
-            setter.set_parameter(&point_params.offset_db, 0.0);
-            setter.end_set_parameter(&point_params.offset_db);
+                setter.begin_set_parameter(&point_params.offset_db);
+                setter.set_parameter(&point_params.offset_db, 0.0);
+                setter.end_set_parameter(&point_params.offset_db);
+            }
         }
     }
 }
