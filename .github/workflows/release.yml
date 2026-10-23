@@ -138,13 +138,27 @@ jobs:
           set -euo pipefail
           {
             echo "Unsigned build. See README.md: trust the macOS builds with System Settings > Privacy & Security > Open Anyway, or \`xattr -dr com.apple.quarantine <path>\`."
-            # The newest `v*` tag merged into HEAD that is not this one.
-            previous_tag="$(git tag --list 'v*' --merge HEAD --sort=-v:refname | while read -r tag; do
-              if [[ $tag != "$TAG" ]]; then
-                echo "$tag"
-                break
+            # The newest `v*` tag whose numeric core (mirroring
+            # update_check::parse_version_tag: strip the `v`, cut at the first
+            # non-digit/non-dot) is strictly below this tag's. Suffix tags like
+            # `v0.6.0-rc1` rank equal to their numeric core on both sides, so
+            # they never interleave above the version they belong to and can
+            # never be picked as a previous release of a newer tag.
+            t=${TAG#v}
+            t=${t%%[^0-9.]*}
+            IFS=. read -r cm cn cp <<< "$t"
+            previous_tag=""
+            while read -r tm tn tp tag; do
+              if ((tm < cm)) || ((tm == cm && tn < cn)) || ((tm == cm && tn == cn && tp < cp)); then
+                previous_tag=$tag
               fi
-            done)"
+            done < <(git tag --list 'v*' --merge "$TAG" |
+              while IFS= read -r tag; do
+                t=${tag#v}
+                t=${t%%[^0-9.]*}
+                IFS=. read -r a b c <<< "$t"
+                printf '%s\n' "${a:-0} ${b:-0} ${c:-0} $tag"
+              done | sort -k1,1n -k2,2n -k3,3n)
             if [[ -n $previous_tag ]]; then
               echo ""
               echo "## Changes since $previous_tag"

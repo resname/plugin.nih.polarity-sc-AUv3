@@ -81,9 +81,16 @@ const LATEST_RELEASE_API_URL: &str =
     "https://api.github.com/repos/resname/resname-spectral-compressor-AUv3/releases/latest";
 
 /// Performs the update check: one GET against `releases/latest`, `None` on any
-/// failure (offline, non-200, malformed, not newer). No retry, no pagination.
+/// failure (offline, non-200, malformed, not newer, or 10s total timeout — the
+/// default ureq config has no timeouts, and a stalled peer would leave the
+/// fetch thread blocked for the GUI's lifetime). No retry, no pagination.
 pub fn fetch_latest_release(running_version: &str) -> Option<LatestRelease> {
-    let mut response = ureq::get(LATEST_RELEASE_API_URL)
+    let agent: ureq::Agent = ureq::config::Config::builder()
+        .timeout_global(Some(std::time::Duration::from_secs(10)))
+        .build()
+        .into();
+    let mut response = agent
+        .get(LATEST_RELEASE_API_URL)
         .header(
             "User-Agent",
             concat!("SpectralCompressor-", env!("CARGO_PKG_VERSION")),
