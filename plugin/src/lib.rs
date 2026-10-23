@@ -451,8 +451,35 @@ impl Plugin for SpectralCompressor {
                 first_non_dc_bin_idx,
             };
 
-            match self.params.thresholds.downwards.threshold.mode.value() {
-                compressor_bank::ThresholdMode::Internal => self.stft.process_overlap_add(
+            if compressor_bank::any_path_sidechain(&self.params) {
+                self.stft.process_overlap_add_sidechain(
+                    buffer,
+                    [&aux.inputs[0]],
+                    overlap_times,
+                    |channel_idx, sidechain_buffer_idx, real_fft_buffer| {
+                        if sidechain_buffer_idx.is_some() {
+                            process_stft_sidechain(
+                                channel_idx,
+                                real_fft_buffer,
+                                &mut self.complex_fft_buffer,
+                                fft_plan,
+                                &self.window_function,
+                                &mut self.compressor_bank,
+                                input_gain,
+                            );
+                        } else {
+                            process_stft_main(
+                                channel_idx,
+                                real_fft_buffer,
+                                &mut self.complex_fft_buffer,
+                                &mut self.compressor_bank,
+                                &stft_main_config,
+                            )
+                        }
+                    },
+                )
+            } else {
+                self.stft.process_overlap_add(
                     buffer,
                     overlap_times,
                     |channel_idx, real_fft_buffer| {
@@ -464,36 +491,7 @@ impl Plugin for SpectralCompressor {
                             &stft_main_config,
                         )
                     },
-                ),
-                compressor_bank::ThresholdMode::SidechainMatch
-                | compressor_bank::ThresholdMode::SidechainCompress => {
-                    self.stft.process_overlap_add_sidechain(
-                        buffer,
-                        [&aux.inputs[0]],
-                        overlap_times,
-                        |channel_idx, sidechain_buffer_idx, real_fft_buffer| {
-                            if sidechain_buffer_idx.is_some() {
-                                process_stft_sidechain(
-                                    channel_idx,
-                                    real_fft_buffer,
-                                    &mut self.complex_fft_buffer,
-                                    fft_plan,
-                                    &self.window_function,
-                                    &mut self.compressor_bank,
-                                    input_gain,
-                                );
-                            } else {
-                                process_stft_main(
-                                    channel_idx,
-                                    real_fft_buffer,
-                                    &mut self.complex_fft_buffer,
-                                    &mut self.compressor_bank,
-                                    &stft_main_config,
-                                )
-                            }
-                        },
-                    )
-                }
+                )
             }
         }
 

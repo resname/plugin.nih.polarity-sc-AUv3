@@ -84,6 +84,18 @@ pub(crate) struct PathState {
     pub(crate) smoothed_gain_difference_db: Vec<f32>,
     /// Prefix sum over this path's raw gain differences, used by the gain smoother.
     pub(crate) gain_smoothing_prefix_db: Vec<f32>,
+    /// Scratch buffer for the linked sidechain magnitudes this path's thresholds are scaled
+    /// with in sidechain-match mode. Only a SidechainMatch path's buffer is guaranteed to be
+    /// valid.
+    pub(crate) linked_sidechain_magnitudes: Vec<f32>,
+}
+
+/// Whether any compression path uses one of the sidechain modes. Decides whether the plugin's
+/// STFT pipeline needs to run the sidechain variant.
+pub(crate) fn any_path_sidechain(params: &SpectralCompressorParams) -> bool {
+    [&params.thresholds.downwards, &params.thresholds.upwards]
+        .iter()
+        .any(|path_params| !matches!(path_params.threshold.mode.value(), ThresholdMode::Internal))
 }
 
 impl PathState {
@@ -97,6 +109,7 @@ impl PathState {
             raw_gain_difference_db: Vec::new(),
             smoothed_gain_difference_db: Vec::new(),
             gain_smoothing_prefix_db: Vec::new(),
+            linked_sidechain_magnitudes: Vec::new(),
         }
     }
 
@@ -117,6 +130,9 @@ impl PathState {
         self.gain_smoothing_prefix_db.reserve_exact(
             (complex_buffer_len + 1).saturating_sub(self.gain_smoothing_prefix_db.len()),
         );
+        self.linked_sidechain_magnitudes.reserve_exact(
+            complex_buffer_len.saturating_sub(self.linked_sidechain_magnitudes.len()),
+        );
     }
 
     fn resize_complex_len(&mut self, complex_buffer_len: usize) {
@@ -129,6 +145,8 @@ impl PathState {
             .resize(complex_buffer_len, 0.0);
         self.gain_smoothing_prefix_db
             .resize(complex_buffer_len + 1, 0.0);
+        self.linked_sidechain_magnitudes
+            .resize(complex_buffer_len, 0.0);
     }
 
     fn reserve_envelopes(&mut self, num_channels: usize, complex_buffer_len: usize) {
@@ -195,8 +213,6 @@ pub struct CompressorBank {
     /// for the current block. The compressor thresholds and knee values are multiplied by these
     /// values to get the effective thresholds.
     sidechain_spectrum_magnitudes: Vec<Vec<f32>>,
-    /// Per-bin channel-linked sidechain magnitudes for the current block.
-    linked_sidechain_magnitudes: Vec<f32>,
     /// The sum of both paths' per-bin gain differences before spectral smoothing.
     combined_raw_gain_difference_db: Vec<f32>,
     /// The sum of both paths' smoothed per-bin gain differences that will be applied.
@@ -809,7 +825,6 @@ impl CompressorBank {
                 Vec::with_capacity(complex_buffer_len);
                 num_channels
             ],
-            linked_sidechain_magnitudes: Vec::with_capacity(complex_buffer_len),
             combined_raw_gain_difference_db: Vec::with_capacity(complex_buffer_len),
             combined_smoothed_gain_difference_db: Vec::with_capacity(complex_buffer_len),
             frozen_gain_difference_db: vec![Vec::with_capacity(complex_buffer_len); num_channels],
@@ -850,9 +865,6 @@ impl CompressorBank {
         for magnitudes in self.sidechain_spectrum_magnitudes.iter_mut() {
             magnitudes.reserve_exact(complex_buffer_len.saturating_sub(magnitudes.len()));
         }
-        self.linked_sidechain_magnitudes.reserve_exact(
-            complex_buffer_len.saturating_sub(self.linked_sidechain_magnitudes.len()),
-        );
         self.combined_raw_gain_difference_db.reserve_exact(
             complex_buffer_len.saturating_sub(self.combined_raw_gain_difference_db.len()),
         );
@@ -893,8 +905,6 @@ impl CompressorBank {
         for magnitudes in self.sidechain_spectrum_magnitudes.iter_mut() {
             magnitudes.resize(complex_buffer_len, 0.0);
         }
-        self.linked_sidechain_magnitudes
-            .resize(complex_buffer_len, 0.0);
         self.combined_raw_gain_difference_db
             .resize(complex_buffer_len, 0.0);
         self.combined_smoothed_gain_difference_db
@@ -997,15 +1007,9 @@ impl CompressorBank {
         first_non_dc_bin: usize,
     ) {
         assert_eq!(buffer.len(), self.ln_freqs.len());
-        let mode = params.thresholds.downwards.threshold.mode.value();
         let freeze_enabled = params.global.compressor_freeze.value();
-        let freeze_supported = matches!(
-            mode,
-            ThresholdMode::Internal
-                | ThresholdMode::SidechainMatch
-                | ThresholdMode::SidechainCompress
-        );
-        self.sync_freeze_state(freeze_enabled && freeze_supported);
+        // Snapshot capture works the same way in every mode, so freezing is always supported
+        self.sync_freeze_state(freeze_enabled);
 
         // The gain difference/reduction amounts are accumulated in `self.analyzer_input_data`. When
         // processing the last channel, this data is divided by the channel count, the envelope
@@ -1028,19 +1032,23 @@ impl CompressorBank {
             self.match_curve_meter.start(self.sample_rate);
         }
 
-        match mode {
-            ThresholdMode::Internal | ThresholdMode::SidechainMatch => {
-                self.measure_match_curve_complex(buffer, channel_idx, params, overlap_times)
-            }
-            ThresholdMode::SidechainCompress => {
-                // This mode measures the sidechain signal instead
-                self.measure_match_curve_sidechain(channel_idx, params, overlap_times)
-            }
+        // The match curve keeps a single (transitional) source: the main input unless some path
+        // follows the sidechain for its envelopes, in which case that's the measured signal
+        // (Task 5 re-homes the convention)
+        let sidechain_envelopes_used = [&params.thresholds.downwards, &params.thresholds.upwards]
+            .iter()
+            .any(|path_params| {
+                path_params.threshold.mode.value() == ThresholdMode::SidechainCompress
+            });
+        if sidechain_envelopes_used {
+            // This mode measures the sidechain signal instead
+            self.measure_match_curve_sidechain(channel_idx, params, overlap_times)
+        } else {
+            self.measure_match_curve_complex(buffer, channel_idx, params, overlap_times)
         };
 
-        // Each path follows its own envelope with its own attack and release times, but the
-        // envelope source is still selected by the single transitional mode parameter (Task 4
-        // switches to per-path modes). The timing scale is advanced once per channel pass after
+        // Each path follows its own envelope with its own attack and release times, from the
+        // source its own mode dictates. The timing scale is advanced once per channel pass after
         // both paths have been updated (see `advance_envelope_timing_scale()`).
         for (path, path_params) in [
             (Path::Downwards, &params.thresholds.downwards),
@@ -1051,7 +1059,7 @@ impl CompressorBank {
             let release_ms =
                 path_params.compressor_release_ms.value() * self.envelope_followers_timing_scale;
 
-            match mode {
+            match path_params.threshold.mode.value() {
                 ThresholdMode::Internal | ThresholdMode::SidechainMatch => {
                     self.update_envelopes(
                         buffer,
@@ -1068,13 +1076,7 @@ impl CompressorBank {
                     // This separate envelope updating function is needed for the channel linking.
                     self.update_envelopes_sidechain(
                         path,
-                        // Transitional until Task 4: the shared channel link setting drives both paths
-                        params
-                            .thresholds
-                            .downwards
-                            .threshold
-                            .sc_channel_link
-                            .value(),
+                        path_params.threshold.sc_channel_link.value(),
                         channel_idx,
                         attack_ms,
                         release_ms,
@@ -1088,8 +1090,8 @@ impl CompressorBank {
         // Each path compresses its own envelope with its own transfer curve, smooths its own raw
         // gain differences (without the DC clamp), and the smoothed curves are then combined
         // (with the DC clamp) into the curve that gets applied
-        self.compress_path(Path::Downwards, channel_idx, params, mode, first_non_dc_bin);
-        self.compress_path(Path::Upwards, channel_idx, params, mode, first_non_dc_bin);
+        self.compress_path(Path::Downwards, channel_idx, params, first_non_dc_bin);
+        self.compress_path(Path::Upwards, channel_idx, params, first_non_dc_bin);
         for bin_idx in 0..num_bins {
             self.combined_raw_gain_difference_db[bin_idx] = self.downwards.raw_gain_difference_db
                 [bin_idx]
@@ -1112,7 +1114,6 @@ impl CompressorBank {
         );
 
         if freeze_enabled
-            && freeze_supported
             && !self.frozen_ir_snapshot_published
             && self.frozen_gain_snapshot_valid.iter().all(|valid| *valid)
         {
@@ -1394,8 +1395,8 @@ impl CompressorBank {
     /// Actually do the thing for a single compression path. [`Self::update_envelopes()`] or
     /// [`Self::update_envelopes_sidechain()`] must have been called for this path before calling
     /// this. In sidechain-match mode the path's thresholds and knee values are scaled by the
-    /// sidechain signal. The channel link setting follows the shared transitional read (Task 4
-    /// switches to per-path modes and channel links).
+    /// sidechain signal. The mode and channel link setting are read from the path's own
+    /// parameters.
     ///
     /// # Panics
     ///
@@ -1406,11 +1407,13 @@ impl CompressorBank {
         path: Path,
         channel_idx: usize,
         params: &SpectralCompressorParams,
-        path_mode: ThresholdMode,
         first_non_dc_bin: usize,
     ) {
-        // Transitional until Task 4: the single (shared) mode parameter drives both paths
-        let mode = path_mode;
+        let path_params = match path {
+            Path::Downwards => &params.thresholds.downwards,
+            Path::Upwards => &params.thresholds.upwards,
+        };
+        let mode = path_params.threshold.mode.value();
         let knee_width_db = match path {
             Path::Downwards => params.compressors.downwards.knee_width_db.value(),
             Path::Upwards => params.compressors.upwards.knee_width_db.value(),
@@ -1422,27 +1425,23 @@ impl CompressorBank {
         assert!(self.downwards.ratios.len() == num_bins);
         assert!(self.upwards.thresholds_db.len() == num_bins);
         assert!(self.upwards.ratios.len() == num_bins);
-        assert!(self.linked_sidechain_magnitudes.len() >= num_bins);
         assert!(self.combined_raw_gain_difference_db.len() >= num_bins);
 
         // In sidechain-match mode the compressor thresholds/knee values are scaled by the
-        // sidechain signal, thus sort of creating a dynamic multiband compressor
+        // sidechain signal, thus sort of creating a dynamic multiband compressor. This uses the
+        // path's own channel link setting.
         let sidechain = mode == ThresholdMode::SidechainMatch;
         if sidechain {
-            // For the channel linking. Transitional until Task 4: the shared channel link
-            // setting drives both paths.
             let num_channels = self.sidechain_spectrum_magnitudes.len() as f32;
-            let other_channels_t = params
-                .thresholds
-                .downwards
-                .threshold
-                .sc_channel_link
-                .value()
-                / num_channels;
+            let other_channels_t = path_params.threshold.sc_channel_link.value() / num_channels;
             let this_channel_t = 1.0 - (other_channels_t * (num_channels - 1.0));
 
             assert!(self.sidechain_spectrum_magnitudes[channel_idx].len() >= num_bins);
-            for (bin_idx, linked_magnitude) in self.linked_sidechain_magnitudes[..num_bins]
+            let path_state = match path {
+                Path::Downwards => &mut self.downwards,
+                Path::Upwards => &mut self.upwards,
+            };
+            for (bin_idx, linked_magnitude) in path_state.linked_sidechain_magnitudes[..num_bins]
                 .iter_mut()
                 .enumerate()
             {
@@ -1492,8 +1491,10 @@ impl CompressorBank {
             // the thresholds are scaled based on the sidechain input, we also need to recompute the
             // knee coefficients.
             let (threshold_db, knee_parabola_scale, knee_parabola_intercept) = if sidechain {
-                let sidechain_scale_db =
-                    util::gain_to_db_fast_epsilon(self.linked_sidechain_magnitudes[bin_idx]);
+                let sidechain_scale_db = util::gain_to_db_fast_epsilon(match path {
+                    Path::Downwards => self.downwards.linked_sidechain_magnitudes[bin_idx],
+                    Path::Upwards => self.upwards.linked_sidechain_magnitudes[bin_idx],
+                });
                 let threshold_db = match path {
                     Path::Downwards => self.downwards.thresholds_db[bin_idx],
                     Path::Upwards => self.upwards.thresholds_db[bin_idx],
@@ -2108,9 +2109,8 @@ mod tests {
         should_update_analyzer_data: bool,
     ) {
         let num_bins = buffer.len();
-        let mode = params.thresholds.downwards.threshold.mode.value();
-        bank.compress_path(Path::Downwards, channel_idx, params, mode, first_non_dc_bin);
-        bank.compress_path(Path::Upwards, channel_idx, params, mode, first_non_dc_bin);
+        bank.compress_path(Path::Downwards, channel_idx, params, first_non_dc_bin);
+        bank.compress_path(Path::Upwards, channel_idx, params, first_non_dc_bin);
         for bin_idx in 0..num_bins {
             bank.combined_raw_gain_difference_db[bin_idx] = bank.downwards.raw_gain_difference_db
                 [bin_idx]
@@ -2169,8 +2169,8 @@ mod tests {
             bank.update_envelopes(&buffer, 0, Path::Downwards, attack_ms, release_ms, 4);
             bank.update_envelopes(&buffer, 0, Path::Upwards, attack_ms, release_ms, 4);
 
-            bank.compress_path(Path::Downwards, 0, &params, ThresholdMode::Internal, 1);
-            bank.compress_path(Path::Upwards, 0, &params, ThresholdMode::Internal, 1);
+            bank.compress_path(Path::Downwards, 0, &params, 1);
+            bank.compress_path(Path::Upwards, 0, &params, 1);
             for bin_idx in 0..num_bins {
                 bank.combined_raw_gain_difference_db[bin_idx] =
                     bank.downwards.raw_gain_difference_db[bin_idx]
@@ -2534,64 +2534,56 @@ mod tests {
             let window_size = 64;
             let num_bins = window_size / 2 + 1;
             let (mut bank, params, _ir) = make_bank_and_params(1, window_size);
-            configure_test_downwards_compression(&mut bank, 0.0, 1.0, 0.0);
-            // Strong upwards compression: threshold +6 dBFS, 4:1 ratio, 6 dB knee. The sidechain
-            // magnitudes are all below this threshold, so every bin gets boosted.
-            let (knee_scale, knee_intercept) = upwards_soft_knee_coefficients(6.0, 6.0, 4.0);
-            bank.upwards.thresholds_db.fill(6.0);
-            bank.upwards.ratios.fill(4.0);
-            bank.upwards.knee_parabola_scale.fill(knee_scale);
-            bank.upwards.knee_parabola_intercept.fill(knee_intercept);
+            // Strong upwards compression: threshold +6 dBFS (flat curve), 4:1 ratio, 6 dB knee.
+            // The sidechain magnitudes are all below this threshold, so every bin gets boosted.
+            // Real `process()` recomputes the bank from params on the first call (resize marks
+            // all dirty flags), so the test configures the compressor through the params.
+            params
+                .thresholds
+                .upwards
+                .threshold
+                .threshold_db
+                .set_plain_value(6.0);
+            params
+                .thresholds
+                .upwards
+                .threshold
+                .curve_slope
+                .set_plain_value(0.0);
+            params.compressors.upwards.ratio.set_plain_value(4.0);
+            params
+                .compressors
+                .upwards
+                .high_freq_ratio_rolloff
+                .set_plain_value(0.0);
+            // Each path decodes its own mode: the downwards path (Internal) follows the silent
+            // main input, the upwards path (SidechainCompress) follows the sidechain signal
+            params
+                .thresholds
+                .downwards
+                .threshold
+                .mode
+                .set_plain_value(ThresholdMode::Internal);
+            params
+                .thresholds
+                .upwards
+                .threshold
+                .mode
+                .set_plain_value(ThresholdMode::SidechainCompress);
 
-            // The main input is silent while the sidechain is quiet-but-alive: the downwards
-            // path (Internal) follows the silent main input, the upwards path
-            // (SidechainCompress) follows the sidechain signal
-            let silent = make_complex_buffer(1.0e-5, num_bins);
+            // The main input is silent while the sidechain is quiet-but-alive. This feeds both
+            // buffers through the full `process()` dispatch the STFT driver would use; each pass
+            // gets a fresh copy since `process()` applies its gains to the buffer.
+            let main = make_complex_buffer(1.0e-5, num_bins);
             let sidechain = make_complex_buffer(0.05, num_bins);
-            bank.process_sidechain(&sidechain, 0);
-
-            // Follow the sidechain for both paths many times so the envelopes converge and the
-            // attack time's slow fade-in does not skew the values
-            let timing_scale = bank.envelope_followers_timing_scale;
-            let downwards_attack_ms =
-                params.thresholds.downwards.compressor_attack_ms.value() * timing_scale;
-            let downwards_release_ms =
-                params.thresholds.downwards.compressor_release_ms.value() * timing_scale;
-            let upwards_attack_ms =
-                params.thresholds.upwards.compressor_attack_ms.value() * timing_scale;
-            let upwards_release_ms =
-                params.thresholds.upwards.compressor_release_ms.value() * timing_scale;
             for _ in 0..200 {
-                bank.update_envelopes(
-                    &silent,
-                    0,
-                    Path::Downwards,
-                    downwards_attack_ms,
-                    downwards_release_ms,
-                    4,
-                );
-                bank.update_envelopes_sidechain(
-                    Path::Upwards,
-                    0.0,
-                    0,
-                    upwards_attack_ms,
-                    upwards_release_ms,
-                    4,
-                );
+                bank.process_sidechain(&sidechain, 0);
+                bank.process(&mut main.clone(), 0, &params, 4, 1);
             }
-            bank.advance_envelope_timing_scale(0, 4);
-
-            bank.compress_path(Path::Downwards, 0, &params, ThresholdMode::Internal, 1);
-            bank.compress_path(
-                Path::Upwards,
-                0,
-                &params,
-                ThresholdMode::SidechainCompress,
-                1,
-            );
 
             // The downwards path is fully gated by the silent main input, but the upwards path
-            // must not be: it follows the sidechain, so every non-DC bin gets compressed
+            // must not be: it follows the sidechain, so every non-DC bin gets compressed. The
+            // combined curve sums both paths, so it carries the upwards path's contribution.
             assert!(bank
                 .downwards
                 .raw_gain_difference_db
@@ -2601,6 +2593,135 @@ mod tests {
                 assert!(
                     bank.upwards.raw_gain_difference_db[bin_idx] != 0.0,
                     "upwards gain difference is zero at bin {bin_idx}"
+                );
+                assert!(
+                    bank.combined_raw_gain_difference_db[bin_idx] != 0.0,
+                    "combined gain difference is zero at bin {bin_idx}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn mixed_mode_thresholds_scale_only_matching_path() {
+        run_with_large_stack(|| {
+            let window_size = 64;
+            let num_bins = window_size / 2 + 1;
+            let (mut bank, params, _ir) = make_bank_and_params(1, window_size);
+            let knee_width_db = params.compressors.downwards.knee_width_db.value();
+
+            // The downwards path compresses at -24 dB / 4:1 with a 6 dB soft knee and scales its
+            // thresholds by the sidechain signal; the upwards path boosts below +6 dB and does
+            // not scale anything (`process()` recomputes the bank from params on the first call,
+            // so the test configures everything through the params)
+            params
+                .thresholds
+                .downwards
+                .threshold
+                .threshold_db
+                .set_plain_value(-24.0);
+            params
+                .thresholds
+                .downwards
+                .threshold
+                .curve_slope
+                .set_plain_value(0.0);
+            params.compressors.downwards.ratio.set_plain_value(4.0);
+            params
+                .compressors
+                .downwards
+                .high_freq_ratio_rolloff
+                .set_plain_value(0.0);
+            params
+                .thresholds
+                .upwards
+                .threshold
+                .threshold_db
+                .set_plain_value(6.0);
+            // Stored slope 3 decodes to 0 dB/oct in Internal mode, so the curve is flat
+            params
+                .thresholds
+                .upwards
+                .threshold
+                .curve_slope
+                .set_plain_value(3.0);
+            params.compressors.upwards.ratio.set_plain_value(4.0);
+            params
+                .compressors
+                .upwards
+                .high_freq_ratio_rolloff
+                .set_plain_value(0.0);
+
+            params
+                .thresholds
+                .downwards
+                .threshold
+                .mode
+                .set_plain_value(ThresholdMode::SidechainMatch);
+            params
+                .thresholds
+                .upwards
+                .threshold
+                .mode
+                .set_plain_value(ThresholdMode::Internal);
+
+            // The main input sits at 0 dBFS per bin; the sidechain sits at -2 dBFS per bin, so a
+            // correctly matching downwards threshold becomes -26 dB
+            let main: Vec<Complex32> = (0..num_bins).map(|_| Complex32::new(1.0, 0.0)).collect();
+            let sidechain_db = util::gain_to_db_fast_epsilon(util::db_to_gain(-2.0));
+            let sidechain: Vec<Complex32> = (0..num_bins)
+                .map(|_| Complex32::new(util::db_to_gain(-2.0), 0.0))
+                .collect();
+
+            // The envelopes follow the main input for both paths (SidechainMatch uses the main
+            // signal for its envelopes), so the envelopes converge to the bin magnitudes. Each
+            // pass gets a fresh copy of the input since `process()` applies its gains to the
+            // buffer.
+            for _ in 0..200 {
+                bank.process_sidechain(&sidechain, 0);
+                bank.process(&mut main.clone(), 0, &params, 4, 1);
+            }
+
+            for bin_idx in 1..num_bins {
+                // Reference math for the downwards path: thresholds and knee coefficients
+                // scaled by the (single-channel) sidechain magnitude
+                let envelope_db =
+                    util::gain_to_db_fast_epsilon(bank.downwards.envelopes[0][bin_idx]);
+                let threshold_db = (-24.0 + sidechain_db).max(util::MINUS_INFINITY_DB);
+                let (scale, intercept) =
+                    downwards_soft_knee_coefficients(threshold_db, knee_width_db, 4.0);
+                let expected = compress_downwards(
+                    envelope_db,
+                    threshold_db,
+                    4.0,
+                    knee_width_db,
+                    scale,
+                    intercept,
+                ) - envelope_db;
+                assert!(
+                    (bank.downwards.raw_gain_difference_db[bin_idx] - expected).abs() < 1.0e-5,
+                    "sidechain-match downwards threshold not scaled at bin {bin_idx}: {} != {expected}",
+                    bank.downwards.raw_gain_difference_db[bin_idx]
+                );
+
+                // Reference math for the upwards path: the stored (unscaled) values
+                let envelope_db = util::gain_to_db_fast_epsilon(bank.upwards.envelopes[0][bin_idx]);
+                let threshold_db = 6.0;
+                let (scale, intercept) =
+                    upwards_soft_knee_coefficients(threshold_db, knee_width_db, 4.0);
+                let expected = (compress_upwards(
+                    envelope_db,
+                    threshold_db,
+                    4.0,
+                    knee_width_db,
+                    scale,
+                    intercept,
+                ) - envelope_db)
+                    .min(envelope_db + params.compressors.upwards.max_gain_change_db.value());
+                assert!(
+                    (bank.upwards.raw_gain_difference_db[bin_idx] - expected).abs() < 1.0e-5,
+                    "internal upwards threshold got scaled at bin {bin_idx}: {} != {expected}",
+                    bank.upwards.raw_gain_difference_db[bin_idx]
                 );
             }
         });
