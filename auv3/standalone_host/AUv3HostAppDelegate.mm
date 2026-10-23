@@ -37,6 +37,67 @@ static uint32_t fourCCFromString(const char *s)
 static MIDIClientRef sMIDIClient = 0;
 static MIDIPortRef sMIDIInputPort = 0;
 
+// Temporary diagnostics for the standalone's unresponsive clicks: a local
+// event monitor showing whether events reach the app, which window is key,
+// and which view claims mouse-downs; plus a window census (catches the case
+// where the plugin's GUI ended up in its own baseview window instead of the
+// host's content view).
+@implementation AUv3HostAppDelegate (ClickDiagnostics)
+- (void)_logWindowKeyState:(NSNotification *)notification
+{
+  NSWindow *window = notification.object;
+  std::cout << "[auv3-standalone] window key-state: " << notification.name.UTF8String
+            << " isKey=" << (window.isKeyWindow ? "YES" : "NO")
+            << " isMain=" << (window.isMainWindow ? "YES" : "NO") << std::endl;
+}
+
+- (void)_installClickDiagnosticsForWindow:(NSWindow *)window auView:(NSView *)auView
+{
+  NSArray<NSNumber *> *types = @[
+    @(NSEventTypeLeftMouseDown), @(NSEventTypeRightMouseDown), @(NSEventTypeMouseMoved),
+    @(NSEventTypeLeftMouseUp), @(NSEventTypeRightMouseUp), @(NSEventTypeAppKitDefined),
+    @(NSEventTypeApplicationDefined),
+  ];
+  [NSEvent addLocalMonitorForEventsMatchingMask:types
+                                        handler:^NSEvent *(NSEvent *event) {
+    NSWindow *eventWindow = event.window;
+    std::cout << "[auv3-standalone] Event type=" << event.type << " keyWindow="
+              << (eventWindow ? (eventWindow.isKeyWindow ? "yes" : "no") : "none");
+    if (eventWindow)
+    {
+      NSView *hitView = [eventWindow.contentView hitTest:[event locationInWindow]];
+      std::cout << " hit=" << (hitView ? NSStringFromClass([hitView class]).UTF8String : "none");
+      std::cout << " windowClass=" << NSStringFromClass([eventWindow class]).UTF8String;
+    }
+    std::cout << std::endl;
+    return event;
+  }];
+
+  NSString *windowIdentifier = window.identifier;
+  std::cout << "[auv3-standalone] hosting window: id="
+            << (windowIdentifier ? windowIdentifier.UTF8String : "none")
+            << " key=" << (window.isKeyWindow ? "YES" : "NO")
+            << " auView=" << NSStringFromClass([auView class]).UTF8String
+            << " auViewAcceptsFirstResponder="
+            << (auView.acceptsFirstResponder ? "YES" : "NO") << std::endl;
+
+  // A census ~1.5s after the GUI appears, when every window/view bridge
+  // should have settled.
+  dispatch_after(
+      dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+      dispatch_get_main_queue(), ^{
+        for (NSWindow *w in [NSApp windows])
+        {
+          if (!w.isVisible) continue;
+          std::cout << "[auv3-standalone] window census: class="
+                    << NSStringFromClass([w class]).UTF8String << " frame=" << w.frame.size.width
+                    << "x" << w.frame.size.height << " key=" << (w.isKeyWindow ? "YES" : "NO")
+                    << " level=" << w.level << std::endl;
+        }
+      });
+}
+@end
+
 @implementation AUv3HostAppDelegate
 {
   AVAudioEngine *_engine;
@@ -674,6 +735,7 @@ static MIDIPortRef sMIDIInputPort = 0;
 
       [window setMovableByWindowBackground:YES];
       [window orderFrontRegardless];
+      [self _installClickDiagnosticsForWindow:window auView:auView];
 
       std::cout << "[auv3-standalone] window styleMask=0x" << std::hex << (unsigned long)window.styleMask
                 << std::dec
@@ -735,6 +797,7 @@ static MIDIPortRef sMIDIInputPort = 0;
     [contentView addSubview:auView];
 
     [window orderFrontRegardless];
+    [self _installClickDiagnosticsForWindow:window auView:auView];
 
     std::cout << "[auv3-standalone] GUI displayed (direct) (" << (int)preferredSize.width << "x"
               << (int)preferredSize.height << ")" << std::endl;
