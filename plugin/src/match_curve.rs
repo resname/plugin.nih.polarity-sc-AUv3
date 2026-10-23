@@ -218,7 +218,7 @@ impl MatchCurveMeter {
         &mut self,
         frames: usize,
         ln_freqs: &[f32],
-        downwards_offset_db: f32,
+        threshold_offset_db: f32,
         fixed_center_frequency: f32,
         fixed_slope: f32,
     ) -> Option<Option<MatchCurveFit>> {
@@ -236,7 +236,7 @@ impl MatchCurveMeter {
             ln_freqs,
             &self.magnitude_sums,
             self.spectrum_count,
-            downwards_offset_db,
+            threshold_offset_db,
             fixed_center_frequency,
             fixed_slope,
         ))
@@ -247,7 +247,7 @@ pub(crate) fn fit_average_curve_constrained(
     ln_freqs: &[f32],
     magnitude_sums: &[f64],
     spectrum_count: u64,
-    downwards_offset_db: f32,
+    threshold_offset_db: f32,
     fixed_center_frequency: f32,
     fixed_slope: f32,
 ) -> Option<MatchCurveFit> {
@@ -255,7 +255,7 @@ pub(crate) fn fit_average_curve_constrained(
         ln_freqs,
         magnitude_sums,
         spectrum_count,
-        downwards_offset_db,
+        threshold_offset_db,
     )?;
     let center_frequency = fixed_center_frequency.clamp(
         THRESHOLD_CURVE_MIN_FREQUENCY_HZ,
@@ -279,13 +279,13 @@ fn fit_average_curve(
     ln_freqs: &[f32],
     magnitude_sums: &[f64],
     spectrum_count: u64,
-    downwards_offset_db: f32,
+    threshold_offset_db: f32,
 ) -> Option<MatchCurveFit> {
     let samples = collect_fit_samples(
         ln_freqs,
         magnitude_sums,
         spectrum_count,
-        downwards_offset_db,
+        threshold_offset_db,
     )?;
     let center_ln = mean_ln_frequency(&samples).clamp(
         THRESHOLD_CURVE_MIN_FREQUENCY_HZ.ln(),
@@ -307,7 +307,7 @@ fn collect_fit_samples(
     ln_freqs: &[f32],
     magnitude_sums: &[f64],
     spectrum_count: u64,
-    downwards_offset_db: f32,
+    threshold_offset_db: f32,
 ) -> Option<Vec<FitSample>> {
     if spectrum_count == 0 {
         return None;
@@ -328,7 +328,7 @@ fn collect_fit_samples(
             continue;
         }
 
-        let average_db = util::gain_to_db_fast_epsilon(average_magnitude) - downwards_offset_db;
+        let average_db = util::gain_to_db_fast_epsilon(average_magnitude) - threshold_offset_db;
         if average_db <= SILENCE_FLOOR_DB {
             continue;
         }

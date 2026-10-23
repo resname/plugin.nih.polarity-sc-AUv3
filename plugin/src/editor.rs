@@ -75,8 +75,10 @@ pub(crate) struct Data {
     pub(crate) delta_active: Arc<AtomicBool>,
     /// Request/result handoff for the editor-triggered output gain match.
     pub(crate) match_runtime: Arc<MatchRuntime>,
-    /// Request/result handoff for the editor-triggered threshold curve match.
-    pub(crate) match_curve_runtime: Arc<MatchCurveRuntime>,
+    /// Request/result handoff for the editor-triggered threshold curve match, one runtime per
+    /// compression path.
+    pub(crate) match_curve_runtime_downwards: Arc<MatchCurveRuntime>,
+    pub(crate) match_curve_runtime_upwards: Arc<MatchCurveRuntime>,
 
     pub(crate) analyzer_data: Arc<AtomicRefCell<triple_buffer::Output<AnalyzerData>>>,
     pub(crate) frozen_ir_data: Arc<AtomicRefCell<triple_buffer::Output<FrozenIrData>>>,
@@ -250,10 +252,10 @@ impl Model for ExportUiModel {
                 match_curve_button::MatchCurveEvent::Started => {
                     self.status_text = String::from("Matching curve...");
                 }
-                match_curve_button::MatchCurveEvent::Result(result) => {
+                match_curve_button::MatchCurveEvent::Result(result, path) => {
                     match result {
                         MatchCurveResult::Matched(fit) => {
-                            self.apply_match_curve(*fit);
+                            self.apply_match_curve(*fit, *path);
                             cx.emit(RawParamEvent::ParametersChanged);
                             self.selected_curve_preset_index = 0;
                             self.refresh_curve_preset_delete_enabled();
@@ -267,8 +269,8 @@ impl Model for ExportUiModel {
 
                     self.refresh_export_availability();
                 }
-                match_curve_button::MatchCurveEvent::ClearRequested => {
-                    self.clear_match_curve();
+                match_curve_button::MatchCurveEvent::ClearRequested(path) => {
+                    self.clear_match_curve(*path);
                     cx.emit(RawParamEvent::ParametersChanged);
                     self.selected_curve_preset_index = 0;
                     self.refresh_curve_preset_delete_enabled();
@@ -580,75 +582,76 @@ impl ExportUiModel {
         }
     }
 
-    fn apply_match_curve(&self, fit: MatchCurveFit) {
+    fn apply_match_curve(&self, fit: MatchCurveFit, path: CompressionPath) {
         let setter = ParamSetter::new(self.gui_context.as_ref());
 
-        // The matching fit is a single spectrum, so it is written to both paths verbatim
-        for threshold in [
-            &self.params.thresholds.downwards.threshold,
-            &self.params.thresholds.upwards.threshold,
-        ] {
-            setter.begin_set_parameter(&threshold.threshold_db);
-            setter.set_parameter(&threshold.threshold_db, fit.intercept);
-            setter.end_set_parameter(&threshold.threshold_db);
+        // The fit is fitted against the spectrum the path's own button metered, so it only
+        // writes the curve of that path
+        let threshold = match path {
+            CompressionPath::Downwards => &self.params.thresholds.downwards.threshold,
+            CompressionPath::Upwards => &self.params.thresholds.upwards.threshold,
+        };
 
-            setter.begin_set_parameter(&threshold.curve_curve);
-            setter.set_parameter(&threshold.curve_curve, fit.curve);
-            setter.end_set_parameter(&threshold.curve_curve);
+        setter.begin_set_parameter(&threshold.threshold_db);
+        setter.set_parameter(&threshold.threshold_db, fit.intercept);
+        setter.end_set_parameter(&threshold.threshold_db);
 
-            for (point_params, point) in threshold.curve_points.iter().zip(fit.points) {
-                setter.begin_set_parameter(&point_params.enabled);
-                setter.set_parameter(&point_params.enabled, point.enabled);
-                setter.end_set_parameter(&point_params.enabled);
+        setter.begin_set_parameter(&threshold.curve_curve);
+        setter.set_parameter(&threshold.curve_curve, fit.curve);
+        setter.end_set_parameter(&threshold.curve_curve);
 
-                setter.begin_set_parameter(&point_params.frequency);
-                setter.set_parameter(&point_params.frequency, point.frequency);
-                setter.end_set_parameter(&point_params.frequency);
+        for (point_params, point) in threshold.curve_points.iter().zip(fit.points) {
+            setter.begin_set_parameter(&point_params.enabled);
+            setter.set_parameter(&point_params.enabled, point.enabled);
+            setter.end_set_parameter(&point_params.enabled);
 
-                setter.begin_set_parameter(&point_params.offset_db);
-                setter.set_parameter(&point_params.offset_db, point.offset_db);
-                setter.end_set_parameter(&point_params.offset_db);
-            }
+            setter.begin_set_parameter(&point_params.frequency);
+            setter.set_parameter(&point_params.frequency, point.frequency);
+            setter.end_set_parameter(&point_params.frequency);
+
+            setter.begin_set_parameter(&point_params.offset_db);
+            setter.set_parameter(&point_params.offset_db, point.offset_db);
+            setter.end_set_parameter(&point_params.offset_db);
         }
     }
 
-    fn clear_match_curve(&self) {
+    fn clear_match_curve(&self, path: CompressionPath) {
         let setter = ParamSetter::new(self.gui_context.as_ref());
 
-        // Clearing resets both paths' curves
-        for threshold in [
-            &self.params.thresholds.downwards.threshold,
-            &self.params.thresholds.upwards.threshold,
-        ] {
-            setter.begin_set_parameter(&threshold.threshold_db);
-            setter.set_parameter(&threshold.threshold_db, -12.0);
-            setter.end_set_parameter(&threshold.threshold_db);
+        // Clearing resets only the path whose Clear button was pressed
+        let threshold = match path {
+            CompressionPath::Downwards => &self.params.thresholds.downwards.threshold,
+            CompressionPath::Upwards => &self.params.thresholds.upwards.threshold,
+        };
 
-            setter.begin_set_parameter(&threshold.center_frequency);
-            setter.set_parameter(&threshold.center_frequency, 1_000.0);
-            setter.end_set_parameter(&threshold.center_frequency);
+        setter.begin_set_parameter(&threshold.threshold_db);
+        setter.set_parameter(&threshold.threshold_db, -12.0);
+        setter.end_set_parameter(&threshold.threshold_db);
 
-            setter.begin_set_parameter(&threshold.curve_slope);
-            setter.set_parameter(&threshold.curve_slope, 0.0);
-            setter.end_set_parameter(&threshold.curve_slope);
+        setter.begin_set_parameter(&threshold.center_frequency);
+        setter.set_parameter(&threshold.center_frequency, 1_000.0);
+        setter.end_set_parameter(&threshold.center_frequency);
 
-            setter.begin_set_parameter(&threshold.curve_curve);
-            setter.set_parameter(&threshold.curve_curve, 0.0);
-            setter.end_set_parameter(&threshold.curve_curve);
+        setter.begin_set_parameter(&threshold.curve_slope);
+        setter.set_parameter(&threshold.curve_slope, 0.0);
+        setter.end_set_parameter(&threshold.curve_slope);
 
-            for point_params in &threshold.curve_points {
-                setter.begin_set_parameter(&point_params.enabled);
-                setter.set_parameter(&point_params.enabled, false);
-                setter.end_set_parameter(&point_params.enabled);
+        setter.begin_set_parameter(&threshold.curve_curve);
+        setter.set_parameter(&threshold.curve_curve, 0.0);
+        setter.end_set_parameter(&threshold.curve_curve);
 
-                setter.begin_set_parameter(&point_params.frequency);
-                setter.set_parameter(&point_params.frequency, 1_000.0);
-                setter.end_set_parameter(&point_params.frequency);
+        for point_params in &threshold.curve_points {
+            setter.begin_set_parameter(&point_params.enabled);
+            setter.set_parameter(&point_params.enabled, false);
+            setter.end_set_parameter(&point_params.enabled);
 
-                setter.begin_set_parameter(&point_params.offset_db);
-                setter.set_parameter(&point_params.offset_db, 0.0);
-                setter.end_set_parameter(&point_params.offset_db);
-            }
+            setter.begin_set_parameter(&point_params.frequency);
+            setter.set_parameter(&point_params.frequency, 1_000.0);
+            setter.end_set_parameter(&point_params.frequency);
+
+            setter.begin_set_parameter(&point_params.offset_db);
+            setter.set_parameter(&point_params.offset_db, 0.0);
+            setter.end_set_parameter(&point_params.offset_db);
         }
     }
 }
@@ -966,15 +969,20 @@ fn path_column(cx: &mut Context, path: CompressionPath) {
                 HStack::new(cx, |cx| {
                     Label::new(cx, "Curve Matching").class("label");
                     HStack::new(cx, |cx| {
+                        let match_curve_runtime_lens = match path {
+                            CompressionPath::Downwards => Data::match_curve_runtime_downwards,
+                            CompressionPath::Upwards => Data::match_curve_runtime_upwards,
+                        };
                         MatchCurveButton::new(
                             cx,
-                            Data::match_curve_runtime,
+                            match_curve_runtime_lens,
                             Data::delta_active,
                             global_params,
+                            path,
                             "Match",
                         )
                         .class("threshold-curve-button");
-                        ClearCurveButton::new(cx, "Clear").class("threshold-curve-button");
+                        ClearCurveButton::new(cx, path, "Clear").class("threshold-curve-button");
                     })
                     .class("curve-matching-button-group");
                 })

@@ -75,8 +75,10 @@ pub struct SpectralCompressor {
 
     /// Shared state for the editor-triggered output gain matching operation.
     match_runtime: Arc<MatchRuntime>,
-    /// Shared state for the editor-triggered threshold curve matching operation.
-    match_curve_runtime: Arc<MatchCurveRuntime>,
+    /// Shared state for the editor-triggered threshold curve matching operation, one runtime per
+    /// compression path.
+    match_curve_runtime_downwards: Arc<MatchCurveRuntime>,
+    match_curve_runtime_upwards: Arc<MatchCurveRuntime>,
     /// Audio-thread local RMS accumulator used while a match operation is running.
     match_meter: MatchMeter,
 
@@ -176,11 +178,13 @@ impl Default for SpectralCompressor {
 
         // Changing any of the compressor threshold or ratio parameters will set an atomic flag in
         // this object that causes the compressor thresholds and ratios to be recalcualted
-        let match_curve_runtime = Arc::new(MatchCurveRuntime::new());
+        let match_curve_runtime_downwards = Arc::new(MatchCurveRuntime::new());
+        let match_curve_runtime_upwards = Arc::new(MatchCurveRuntime::new());
         let compressor_bank = compressor_bank::CompressorBank::new(
             analyzer_input_data,
             frozen_ir_input_data,
-            match_curve_runtime.clone(),
+            match_curve_runtime_downwards.clone(),
+            match_curve_runtime_upwards.clone(),
             2,
             MAX_WINDOW_SIZE,
         );
@@ -202,7 +206,8 @@ impl Default for SpectralCompressor {
             dry_wet_mixer: dry_wet_mixer::DryWetMixer::new(0, 0, 0),
             compressor_bank,
             match_runtime: Arc::new(MatchRuntime::new()),
-            match_curve_runtime,
+            match_curve_runtime_downwards,
+            match_curve_runtime_upwards,
             match_meter: MatchMeter::new(),
 
             plan_for_order,
@@ -328,7 +333,8 @@ impl Plugin for SpectralCompressor {
 
                 delta_active: self.delta_active.clone(),
                 match_runtime: self.match_runtime.clone(),
-                match_curve_runtime: self.match_curve_runtime.clone(),
+                match_curve_runtime_downwards: self.match_curve_runtime_downwards.clone(),
+                match_curve_runtime_upwards: self.match_curve_runtime_upwards.clone(),
 
                 analyzer_data: self.analyzer_output_data.clone(),
                 frozen_ir_data: self.frozen_ir_output_data.clone(),

@@ -5,33 +5,42 @@ use std::time::{Duration, Instant};
 use nih_plug_vizia::vizia::prelude::*;
 use nih_plug_vizia::widgets::param_base::ParamWidgetBase;
 
+use crate::compressor_bank::Path as CompressionPath;
 use crate::match_curve::{MatchCurveResult, MatchCurveRuntime};
 use crate::GlobalParams;
 
 #[derive(Debug)]
 pub enum MatchCurveEvent {
     Started,
-    Result(MatchCurveResult),
-    ClearRequested,
+    Result(MatchCurveResult, CompressionPath),
+    ClearRequested(CompressionPath),
 }
 
 pub struct MatchCurveButton {
     match_curve_runtime: Arc<MatchCurveRuntime>,
     delta_active: Arc<AtomicBool>,
     bypass_param: ParamWidgetBase,
+    path: CompressionPath,
 }
 
-pub struct ClearCurveButton;
+pub struct ClearCurveButton {
+    path: CompressionPath,
+}
 
 impl ClearCurveButton {
-    pub fn new<T>(cx: &mut Context, label: impl Res<T> + Clone) -> Handle<'_, Self>
+    pub fn new<T>(
+        cx: &mut Context,
+        path: CompressionPath,
+        label: impl Res<T> + Clone,
+    ) -> Handle<'_, Self>
     where
         T: ToString,
     {
-        Self.build(cx, |cx| {
-            Label::new(cx, label).hoverable(false);
-        })
-        .class("editor-mode")
+        Self { path }
+            .build(cx, |cx| {
+                Label::new(cx, label).hoverable(false);
+            })
+            .class("editor-mode")
     }
 }
 
@@ -46,7 +55,7 @@ impl View for ClearCurveButton {
             | WindowEvent::MouseDoubleClick(MouseButton::Left)
             | WindowEvent::MouseTripleClick(MouseButton::Left) => {
                 meta.consume();
-                cx.emit(MatchCurveEvent::ClearRequested);
+                cx.emit(MatchCurveEvent::ClearRequested(self.path));
             }
             _ => {}
         });
@@ -59,6 +68,7 @@ impl MatchCurveButton {
         match_curve_lens: LMatch,
         delta_lens: LDelta,
         global_params: LGlobal,
+        path: CompressionPath,
         label: impl Res<T> + Clone,
     ) -> Handle<'_, Self>
     where
@@ -71,6 +81,7 @@ impl MatchCurveButton {
             match_curve_runtime: match_curve_lens.get(cx),
             delta_active: delta_lens.get(cx),
             bypass_param: ParamWidgetBase::new(cx, global_params, |params| &params.bypass),
+            path,
         }
         .build(cx, |cx| {
             Label::new(cx, label).hoverable(false);
@@ -101,15 +112,17 @@ impl View for MatchCurveButton {
                 self.match_curve_runtime.request();
 
                 let runtime = self.match_curve_runtime.clone();
+                let path = self.path;
                 cx.spawn(move |proxy| {
                     let deadline = Instant::now() + Duration::from_secs(15);
                     loop {
                         if let Some(result) = runtime.take_finished_result() {
-                            let _ = proxy.emit(MatchCurveEvent::Result(result));
+                            let _ = proxy.emit(MatchCurveEvent::Result(result, path));
                             return;
                         }
                         if Instant::now() >= deadline {
-                            let _ = proxy.emit(MatchCurveEvent::Result(MatchCurveResult::Failed));
+                            let _ =
+                                proxy.emit(MatchCurveEvent::Result(MatchCurveResult::Failed, path));
                             return;
                         }
                         std::thread::sleep(Duration::from_millis(100));
