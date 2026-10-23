@@ -807,8 +807,32 @@ static void midiInputCallback(const MIDIPacketList *pktlist, void *readProcRefCo
   NSDictionary *state = [NSDictionary dictionaryWithContentsOfFile:path];
   if (state)
   {
-    _avAudioUnit.AUAudioUnit.fullState = state;
-    std::cout << "[auv3-standalone] State restored from " << [path UTF8String] << std::endl;
+    // AUParameterGroup _deserialize:fromSetFullState: throws an uncaught
+    // NSException (SIGTRAP) on state it cannot fully deserialize — e.g. state
+    // saved by an older version whose parameter tree has since changed
+    // (v0.5.22 → v0.6.0 renamed threshold params and dropped per-compressor
+    // attack/release). Treat that like any other failed load: skip the
+    // restore, keep the plugin on its defaults, and preserve the file under
+    // a distinct name so the crash cannot repeat on every launch.
+    @try
+    {
+      _avAudioUnit.AUAudioUnit.fullState = state;
+      std::cout << "[auv3-standalone] State restored from " << [path UTF8String] << std::endl;
+    }
+    @catch (NSException *e)
+    {
+      std::cout << "[auv3-standalone] WARNING: failed to restore saved state ("
+                << [e.reason UTF8String] << ") — moving it aside and using defaults"
+                << std::endl;
+      NSString *backup = [path stringByAppendingString:@".unreadable"];
+      [[NSFileManager defaultManager] removeItemAtPath:backup error:NULL];
+      NSError *moveError = nil;
+      if (![[NSFileManager defaultManager] moveItemAtPath:path toPath:backup error:&moveError])
+      {
+        std::cout << "[auv3-standalone] WARNING: could not move the state file aside: "
+                  << [moveError.localizedDescription UTF8String] << std::endl;
+      }
+    }
   }
 }
 
