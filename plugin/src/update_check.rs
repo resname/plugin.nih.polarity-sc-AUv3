@@ -12,7 +12,8 @@ pub fn parse_version_tag(tag: &str) -> Option<(u64, u64, u64)> {
 
     // Cut at the first non-`[0-9.]` character so suffixes like `-rc1` fall off,
     // then require every `.`-separated piece to be numeric.
-    let numeric_core = tag.find(|c: char| !(c.is_ascii_digit() || c == '.'))
+    let numeric_core = tag
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
         .map(|end| &tag[..end])
         .unwrap_or(tag);
     let mut components = numeric_core.split('.').map(|component| {
@@ -46,10 +47,6 @@ pub fn version_is_newer(latest_tag: &str, running: &str) -> bool {
     latest > running
 }
 
-/// The plugin's origin repo. Releases are published only here; the API
-/// endpoint and the button below are hardcoded to it.
-const REPO: &str = "resname/plugin.nih.polarity-sc-AUv3";
-
 /// The GitHub page the strip's button opens.
 pub const RELEASES_LATEST_PAGE_URL: &str =
     "https://github.com/resname/plugin.nih.polarity-sc-AUv3/releases/latest";
@@ -59,7 +56,6 @@ pub const RELEASES_LATEST_PAGE_URL: &str =
 #[derive(Clone, Debug)]
 pub struct LatestRelease {
     pub tag: String,
-    pub version: (u64, u64, u64),
     pub page_url: String,
 }
 
@@ -69,21 +65,16 @@ pub struct LatestRelease {
 fn parse_release_json(json: &str, running_version: &str) -> Option<LatestRelease> {
     let body = serde_json::from_str::<serde_json::Value>(json).ok()?;
     let tag = body.get("tag_name")?.as_str()?.to_owned();
-    let version = parse_version_tag(&tag)?;
+    // Reject tags without a parseable numeric version, then only show
+    // strictly newer releases.
+    parse_version_tag(&tag)?;
     if !version_is_newer(&tag, running_version) {
         return None;
     }
 
-    let page_url = body
-        .get("html_url")?
-        .as_str()?
-        .to_owned();
+    let page_url = body.get("html_url")?.as_str()?.to_owned();
 
-    Some(LatestRelease {
-        tag,
-        version,
-        page_url,
-    })
+    Some(LatestRelease { tag, page_url })
 }
 
 const LATEST_RELEASE_API_URL: &str =
@@ -144,7 +135,6 @@ mod tests {
         let json = r#"{"tag_name":"v0.7.0","html_url":"https://github.com/resname/plugin.nih.polarity-sc-AUv3/releases/tag/v0.7.0"}"#;
         let release = parse_release_json(json, "0.6.0").expect("should parse");
         assert_eq!(release.tag, "v0.7.0");
-        assert_eq!(release.version, (0, 7, 0));
         assert_eq!(
             release.page_url,
             "https://github.com/resname/plugin.nih.polarity-sc-AUv3/releases/tag/v0.7.0"
@@ -153,7 +143,8 @@ mod tests {
 
     #[test]
     fn parse_release_json_older_is_none() {
-        let json = r#"{"tag_name":"v0.6.0","html_url":"https://github.com/x/y/releases/tag/v0.6.0"}"#;
+        let json =
+            r#"{"tag_name":"v0.6.0","html_url":"https://github.com/x/y/releases/tag/v0.6.0"}"#;
         assert!(parse_release_json(json, "0.6.0").is_none());
     }
 }
