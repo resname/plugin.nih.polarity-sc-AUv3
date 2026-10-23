@@ -140,6 +140,44 @@
   color: #e6b23a;
 }
 
+/* Update-available strip, overlaying the header's title area. */
+
+.update-strip {
+  position-type: self-directed;
+  left: 250px;
+  right: 10px;
+  top: 15px;
+  height: 30px;
+  background-color: #302b17;
+  border-color: #e6b23a;
+  border-width: 1px;
+  border-radius: 3px;
+  col-between: 8px;
+  child-left: 8px;
+}
+
+.update-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 5px;
+  background-color: #e6b23a;
+}
+
+.update-text {
+  color: #ffffff;
+  font-size: 13;
+}
+
+.update-open-button {
+  width: 80px;
+  height: 24px;
+}
+
+.update-dismiss-button {
+  width: 60px;
+  height: 24px;
+}
+
 /* Export button group. */
 .export-button {
   width: 180px;

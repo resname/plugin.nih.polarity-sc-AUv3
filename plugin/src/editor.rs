@@ -44,6 +44,7 @@ use crate::curve_preset::{
 use crate::frozen_ir::FrozenIrData;
 use crate::match_curve::{MatchCurveFit, MatchCurveResult, MatchCurveRuntime};
 use crate::match_level::{MatchResult, MatchRuntime};
+use crate::update_check;
 use crate::{SpectralCompressor, SpectralCompressorParams};
 
 mod analyzer;
@@ -362,6 +363,51 @@ impl Model for ExportUiModel {
     }
 }
 
+#[derive(Lens)]
+/// Editor-local state for the update-available strip. `None` while the check
+/// has not reported a newer release (or failed, or was dismissed).
+struct UpdateModel {
+    visible_release: Option<update_check::LatestRelease>,
+}
+
+enum UpdateEvent {
+    FetchDone(Option<update_check::LatestRelease>),
+    Dismiss,
+}
+
+impl UpdateModel {
+    fn build(cx: &mut Context) {
+        Self {
+            visible_release: None,
+        }
+        .build(cx);
+
+        // Fetch on a background thread so the editor opens instantly; the
+        // result reaches this model as an [`UpdateEvent`] whenever it
+        // finishes. Nothing is shown on failures.
+        cx.spawn(move |cx| {
+            let result = update_check::fetch_latest_release(env!("CARGO_PKG_VERSION"));
+            if cx.emit(UpdateEvent::FetchDone(result)).is_err() {
+                nih_log!("Update check finished after the editor closed");
+            }
+        });
+    }
+}
+
+impl Model for UpdateModel {
+    fn event(&mut self, _cx: &mut EventContext, event: &mut Event) {
+        event.map(|update_event: &UpdateEvent, _meta| match update_event {
+            UpdateEvent::FetchDone(result) => {
+                if let Some(release) = result {
+                    nih_log!("Update available: {}", release.tag);
+                    self.visible_release = Some(release.clone());
+                }
+            }
+            UpdateEvent::Dismiss => self.visible_release = None,
+        });
+    }
+}
+
 #[cfg(feature = "hot-reload")]
 enum HotReloadEvent {
     CssChanged,
@@ -638,6 +684,7 @@ pub(crate) fn create(editor_state: Arc<ViziaState>, editor_data: Data) -> Option
                 editor_data.params.clone(),
                 gui_context,
             );
+            UpdateModel::build(cx);
 
             HStack::new(cx, |cx| {
                 main_column(cx);
@@ -651,10 +698,55 @@ pub(crate) fn create(editor_state: Arc<ViziaState>, editor_data: Data) -> Option
 fn main_column(cx: &mut Context) {
     VStack::new(cx, |cx| {
         header_bar(cx);
+        update_strip(cx);
         globals_bar(cx);
         threshold_row(cx);
     })
     .class("main-column");
+}
+
+/// An absolutely positioned strip overlaying the header bar's title area while
+/// a newer GitHub release is available. Left of the editor's header controls
+/// (at 250px) stay clickable; the strip dismisses for this GUI session only.
+fn update_strip(cx: &mut Context) {
+    HStack::new(cx, |cx| {
+        Element::new(cx).class("update-dot");
+
+        let version_text = UpdateModel::visible_release.map(|release| match release {
+            Some(release) => format!("{} available", release.tag),
+            None => String::new(),
+        });
+        Label::new(cx, version_text).class("update-text");
+
+        Button::new(
+            cx,
+            move |ex| {
+                // The fetched release's own page when the check succeeded
+                // (the strip shows that release), otherwise the fallback URL.
+                let url = UpdateModel::visible_release
+                    .get(ex)
+                    .map(|release| release.page_url)
+                    .unwrap_or_else(|| update_check::RELEASES_LATEST_PAGE_URL.to_owned());
+                std::thread::spawn(move || {
+                    let _ = open::that(url);
+                });
+            },
+            |cx| Label::new(cx, "Open"),
+        )
+        .class("update-open-button");
+
+        Button::new(
+            cx,
+            |ex| {
+                ex.emit(UpdateEvent::Dismiss);
+            },
+            |cx| Label::new(cx, "Hide"),
+        )
+        .class("update-dismiss-button");
+    })
+    .position_type(PositionType::SelfDirected)
+    .class("update-strip")
+    .display(UpdateModel::visible_release.map(|release| Display::from(release.is_some())));
 }
 
 /// The bar on top of the threshold columns holding the controls shared between both compression
