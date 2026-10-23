@@ -903,8 +903,9 @@ fn path_column(cx: &mut Context, path: CompressionPath) {
                 Label::new(cx, "COMPRESSOR").class("section-label");
             }
 
-            if name == format!("{name_prefix} Max Boost") {
-                // The downwards path never adds gain, so its dead cap stays visible but inert
+            // The downwards path never adds gain, so its dead cap stays visible but inert. The
+            // upwards path's cap is a regular interactive parameter.
+            if name == format!("{name_prefix} Max Boost") && path == CompressionPath::Downwards {
                 HStack::new(cx, |cx| {
                     Label::new(cx, "Max Boost").class("label");
                     GenericUi::draw_widget(cx, compressor_params, param_ptr);
