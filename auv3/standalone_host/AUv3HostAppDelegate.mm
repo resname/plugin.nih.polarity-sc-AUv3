@@ -53,12 +53,9 @@ static MIDIPortRef sMIDIInputPort = 0;
 
 - (void)_installClickDiagnosticsForWindow:(NSWindow *)window auView:(NSView *)auView
 {
-  NSArray<NSNumber *> *types = @[
-    @(NSEventTypeLeftMouseDown), @(NSEventTypeRightMouseDown), @(NSEventTypeMouseMoved),
-    @(NSEventTypeLeftMouseUp), @(NSEventTypeRightMouseUp), @(NSEventTypeAppKitDefined),
-    @(NSEventTypeApplicationDefined),
-  ];
-  [NSEvent addLocalMonitorForEventsMatchingMask:types
+  NSEventMask eventMask = NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown |
+                          NSEventMaskMouseMoved | NSEventMaskLeftMouseUp | NSEventMaskRightMouseUp;
+  [NSEvent addLocalMonitorForEventsMatchingMask:eventMask
                                         handler:^NSEvent *(NSEvent *event) {
     NSWindow *eventWindow = event.window;
     std::cout << "[auv3-standalone] Event type=" << event.type << " keyWindow="
