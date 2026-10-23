@@ -1023,24 +1023,29 @@ fn path_column(cx: &mut Context, path: CompressionPath) {
 
 /// Creates the analyzer panel on the right side of the editor.
 fn analyzer_column(cx: &mut Context) {
-    HStack::new(cx, |cx| {
+    VStack::new(cx, |cx| {
+        // Caption so the pair below reads as the curve-to-edit selection rather than
+        // unlabeled buttons.
+        Label::new(cx, "Curve:").class("curve-edit-caption");
         // The analyzer shows and edits the curve points of the selected path
-        SelectStateButton::new(
-            cx,
-            Data::selected_threshold_curve,
-            0,
-            "Down",
-            "threshold-curve-button",
-        );
-        SelectStateButton::new(
-            cx,
-            Data::selected_threshold_curve,
-            1,
-            "Up",
-            "threshold-curve-button",
-        );
-    })
-    .class("curve-matching-button-group");
+        HStack::new(cx, |cx| {
+            SelectStateButton::new(
+                cx,
+                Data::selected_threshold_curve,
+                0,
+                "Down",
+                "threshold-curve-button-down",
+            );
+            SelectStateButton::new(
+                cx,
+                Data::selected_threshold_curve,
+                1,
+                "Up",
+                "threshold-curve-button-up",
+            );
+        })
+        .class("curve-matching-button-group");
+    });
     Analyzer::new(
         cx,
         Data::analyzer_data,
@@ -1078,9 +1083,9 @@ impl SelectStateButton {
         })
         .class(css_class);
 
-        // Grey the button out while its value is already selected
+        // Highlight the button (styled per :checked in theme.css) while its value is selected
         handle
-            .disabled(selected_state.map(move |selected| selected.load(Ordering::Relaxed) == value))
+            .checked(selected_state.map(move |selected| selected.load(Ordering::Relaxed) == value))
     }
 }
 

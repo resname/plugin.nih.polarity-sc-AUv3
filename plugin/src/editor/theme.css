@@ -207,9 +207,27 @@
   col-between: 4px;
 }
 
-.threshold-curve-button {
+.threshold-curve-button-down,
+.threshold-curve-button-up {
   width: 88px;
   background-color: #3a3a3a;
+}
+
+/* The selected curve button lights up in the matching curve's color so the
+   selection state is obvious: these two buttons pick which curve (orange
+   downwards / teal upwards) the analyzer edits. */
+.threshold-curve-button-down:checked {
+  background-color: rgba(230, 179, 58, 0.9);
+  color: #1f1f1f;
+}
+.threshold-curve-button-up:checked {
+  background-color: rgba(106, 200, 216, 0.9);
+  color: #1f1f1f;
+}
+
+.curve-edit-caption {
+  color: #8e8e95;
+  child-left: 3px;
 }
 
 .curve-preset-control-group {
